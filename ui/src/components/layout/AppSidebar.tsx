@@ -19,6 +19,7 @@ import {
   Plug,
   Settings,
   ShieldCheck,
+  Target,
   TrendingUp,
   UserRound,
   Workflow,
@@ -99,6 +100,11 @@ const NAV_SECTIONS: SidebarNavSection[] = [
         title: "Providers",
         url: "/provider-connections",
         icon: Plug,
+      },
+      {
+        title: "Leads Acquisition",
+        url: "/leads-acquisition",
+        icon: Target,
       },
       {
         title: "Models",

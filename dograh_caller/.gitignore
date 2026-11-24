@@ -1,0 +1,43 @@
+# Secrets - all keys live in .env (template: .env.example)
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*key*.txt
+*secret*
+*credentials*
+
+# Results folder: call results, phone numbers, Dograh responses
+output/
+
+# Lead data contains phone numbers / emails / addresses
+*.xlsx
+*.xls
+*.csv
+*.log
+# Only the fictional sample leads (555-01xx numbers) may be committed.
+# Real lead files such as examples/datapoints.xlsx stay ignored.
+!examples/sample_leads.xlsx
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node (frontend build sources only; dashboard/static/ is committed)
+node_modules/
+
+# Editors / OS
+.vscode/
+.idea/
+.claude/settings.local.json
+.DS_Store
+Thumbs.db
+desktop.ini
+~$*

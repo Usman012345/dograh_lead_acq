@@ -1,0 +1,33 @@
+# Lead streamer - files that must never be committed
+
+# Secrets: DATABASE_URL (with the database password) and STREAM_TOKEN.
+# Template to commit instead: .env.example
+.env
+.env.*
+!.env.example
+
+# Python virtual environment (created by install.sh in /opt/lead_streamer/.venv)
+.venv/
+venv/
+env/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs and local output (may contain lead data or connection details)
+*.log
+*.json.bak
+*.csv
+*.xlsx
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+~$*

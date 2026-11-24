@@ -1,0 +1,118 @@
+# ==============================================================================
+# SERVICES WE SELL
+# ==============================================================================
+# Gemini reads these descriptions to decide which service (if any) a lead is
+# likely to be interested in. Each lead whose probability for a service is
+# >= INTEREST_THRESHOLD is put into that service's campaign and called by its
+# Dograh agent. If several services pass, the highest probability wins.
+#
+# To add a new service: copy one block below, give it a unique `id`, set the
+# Dograh `agent_id`, write the three descriptions, and set `enabled: true`.
+# No code changes are needed. Full guide: SERVICES.md
+#
+# Tip: when two services overlap (Draftliner and Paradise both touch
+# estimating), say in each `not_a_fit` which leads belong to the OTHER one.
+# ==============================================================================
+
+services:
+
+  # ----------------------------------------------------------------------------
+  - id: draftliner
+    name: Draftliner
+    enabled: true
+    # Dograh agent (workflow) ID - 2 = "Testing Lead qualification - outbound"
+    agent_id: 2
+
+    description: |
+      Draftliner (draftliner.com, built by Bitwords Technologies Inc., New York) is a remote
+      back-office and design-production partner for the AEC industry (architecture,
+      engineering, construction). It does no physical construction. What it sells is ongoing
+      office capacity, not one-off job pricing:
+      - Dedicated remote professionals, multi-role teams, or a fully managed department:
+        estimators, quantity-takeoff specialists, CAD drafters, Revit/BIM modelers, BIM and MEP
+        coordinators, structural and shop-drawing detailers, civil drafters, schedulers,
+        project coordinators, document controllers, permit specialists and 3D artists. They
+        work inside the client's own software during US business hours; a vetted shortlist is
+        delivered within 48 hours; Draftliner handles hiring, payroll and HR.
+      - Design and engineering production: architectural CAD drafting, Revit/BIM modeling,
+        permit and construction-document sets, 3D renderings, interior and landscape drafting,
+        structural and civil drafting, MEP coordination and clash detection, shop and
+        fabrication drawings, drawing QA (under the client's licensed architect or engineer).
+      - Preconstruction and project operations: takeoffs, cost estimating, bid management,
+        scheduling, RFIs and submittals, document control, construction admin and CRM.
+      - A free browser-based AI Design Studio (2D CAD and 3D BIM) as an entry point.
+
+    good_fit: |
+      A business with recurring drawing, design, engineering, BIM or office/project-management
+      work that remote staff could take over, for example:
+      - architecture, interior design and design-build firms;
+      - engineering firms (structural, civil, MEP, electrical design and engineering);
+      - general contractors that run preconstruction, bidding, project management or
+        coordination across several trades, sectors or projects at once;
+      - homebuilders, custom-home builders and remodeling companies that need plans, permit
+        sets or renderings;
+      - real estate developers and property owners running construction projects;
+      - specialty contractors that produce shop or fabrication drawings or do design work
+        (structural steel, millwork, curtain wall, MEP design-build, fire-protection design).
+      Strong signals: design, engineering, architect, drafting, CAD, BIM, Revit, permit,
+      preconstruction, project management, coordination, design-build, shop drawings,
+      multiple trades or sectors, commercial / institutional / infrastructure work, larger
+      or growing firms.
+
+    not_a_fit: |
+      - A small single-trade installation, repair or service crew with no sign of design,
+        drafting, engineering or project-management work (e.g. siding, gutters, a small
+        masonry or concrete crew, HVAC or plumbing service, equipment installers). If such a
+        business mainly needs help pricing its jobs for bids, it is a Paradise Estimating lead,
+        not a Draftliner lead.
+      - Landscape maintenance, handyman, cleaning, moving, pest control or similar services.
+      - Businesses outside construction / AEC, individual homeowners, real estate agents or
+        brokers who do not build, and pure material suppliers or manufacturers.
+
+  # ----------------------------------------------------------------------------
+  - id: paradise
+    name: Paradise Estimating
+    enabled: true
+    # Dograh agent (workflow) ID - 3 = "Paradise Agent - outbound" (Olivia)
+    agent_id: 3
+
+    description: |
+      Paradise Estimating (paradiseestimating.com, Brooklyn NY, founded 2012) is an outsourced
+      construction estimating and quantity-takeoff service, paid per project. A contractor
+      sends the drawings of a job it wants to bid (PDF, DWG or CAD) and receives a priced
+      estimate or material takeoff (Excel and PDF, CSI divisions, line items, material,
+      labor and equipment costs) to prepare a competitive bid. Services include construction
+      cost estimating, quantity takeoffs, residential / commercial / industrial estimating,
+      preliminary and budget estimates, remodeling and addition estimates, bid-submission
+      consultation, Xactimate estimates, CPM / Primavera / MS Project scheduling, and dedicated
+      estimating support for busy periods.
+      Trades covered: concrete, electrical, plumbing, HVAC, MEP, drywall, roofing, lumber and
+      framing, plus masonry, brick and block, siding, stucco, insulation, fire alarm, fire
+      sprinkler, fireproofing, metals, millwork, flooring, painting, openings, sitework,
+      excavation, cut and fill, grading, asphalt paving, demolition, fencing, landscaping
+      construction, swimming pools, telecom and low-voltage, security and more.
+
+    good_fit: |
+      A business that bids or prices construction jobs from drawings and could use outside
+      estimating or takeoff help, especially when bid volume is high or it has no
+      full-time estimator:
+      - trade subcontractors and specialty contractors of any size in any trade (concrete,
+        masonry, electrical, plumbing, HVAC / mechanical, drywall, framing, roofing, siding,
+        flooring, painting, insulation, fire protection, sitework / excavation, paving,
+        fencing, landscape construction, pools, low-voltage, etc.);
+      - general contractors, builders and remodelers bidding residential, commercial or
+        industrial projects;
+      - developers and owners who need early budget estimates or cost checks;
+      - restoration / insurance contractors that need Xactimate estimates.
+      Strong signals: contractor, subcontractor, specialty contractor, a named building
+      trade, bidding, estimating, takeoffs, commercial or new construction, installation of
+      building systems, multiple market sectors.
+
+    not_a_fit: |
+      - Architecture, interior-design or engineering firms whose main need is design,
+        drafting, BIM or engineering production rather than pricing jobs - those are
+        Draftliner leads.
+      - Pure repair, maintenance or service businesses that never bid projects from drawings
+        (appliance repair, HVAC tune-ups only, cleaning, handyman, lawn care).
+      - Businesses outside construction, individual homeowners, real estate agents, and
+        suppliers that only sell materials.

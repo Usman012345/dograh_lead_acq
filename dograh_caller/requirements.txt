@@ -1,0 +1,8 @@
+google-genai>=2.26,<3
+phonenumbers>=8.13
+requests>=2.31
+openpyxl>=3.1
+PyYAML>=6.0
+python-dotenv>=1.0
+fastapi>=0.115
+uvicorn>=0.30
