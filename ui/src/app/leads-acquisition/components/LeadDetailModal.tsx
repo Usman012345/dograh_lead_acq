@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { LeadDetailResponse, ServiceInfo, TranscriptTurn } from "../types";
+
 import { apiPath } from "../lib/api";
 import {
   formatDateTime,
@@ -10,6 +10,7 @@ import {
   serviceColor,
   transcriptOffset,
 } from "../lib/format";
+import { LeadDetailResponse, ServiceInfo, TranscriptTurn } from "../types";
 import {
   AlertIcon,
   BadgeCheckIcon,
@@ -18,9 +19,7 @@ import {
   ChevronRightIcon,
   ClockIcon,
   CloseIcon,
-  ExternalIcon,
   FileTextIcon,
-  MinusCircleIcon,
   PhoneForwardIcon,
   PhoneIcon,
   ShieldPhoneIcon,
@@ -195,7 +194,7 @@ export const LeadDetailModal: React.FC<Props> = ({ leadId, leadIds, section, dat
 
   useEffect(() => {
     if (shown && section === "call") callRef.current?.scrollIntoView({ block: "start" });
-  }, [shown?.lead_id, section]);
+  }, [shown, section]);
 
   const index = leadIds.indexOf(leadId);
   const previous = index > 0 ? leadIds[index - 1] : null;

@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ColumnDef, LeadsResponse, OpenLeadRequest, ServiceInfo, SummaryResponse, ViewName } from "../types";
+
 import { apiPath } from "../lib/api";
 import { formatDateTime, formatPhone, isHttpLink, serviceColor } from "../lib/format";
+import { ColumnDef, LeadsResponse, OpenLeadRequest, ServiceInfo, SummaryResponse, ViewName } from "../types";
 import {
   AlertIcon,
   BadgeCheckIcon,
@@ -257,6 +258,7 @@ const Cell: React.FC<CellProps> = ({ column, row, services, thresholdPct, onOpen
 
 interface Props {
   view: ViewName;
+  batchId?: string | null;
   initialFilter?: string;
   summary: SummaryResponse;
   isDetailOpen: boolean;
@@ -266,7 +268,7 @@ interface Props {
 
 const PAGE_SIZE = 50;
 
-export const ViewModal: React.FC<Props> = ({ view, initialFilter, summary, isDetailOpen, onClose, onSelectLead }) => {
+export const ViewModal: React.FC<Props> = ({ view, batchId, initialFilter, summary, isDetailOpen, onClose, onSelectLead }) => {
   const meta = VIEW_META[view];
   const services = summary.services;
   const dataAsOf = summary.data_as_of;
@@ -303,6 +305,7 @@ export const ViewModal: React.FC<Props> = ({ view, initialFilter, summary, isDet
       const left = scrollRef.current?.scrollLeft ?? 0;
       try {
         const params = new URLSearchParams({ view, sort, order, page: String(page), page_size: String(PAGE_SIZE) });
+        if (batchId) params.set("batch_id", batchId);
         if (query.trim()) params.set("q", query.trim());
         if (filter) params.set("filter", filter);
         if (serviceFilter) params.set("service", serviceFilter);
@@ -323,7 +326,7 @@ export const ViewModal: React.FC<Props> = ({ view, initialFilter, summary, isDet
         if (!signal.aborted) setLoading(false);
       }
     },
-    [view, sort, order, page, query, filter, serviceFilter],
+    [view, batchId, sort, order, page, query, filter, serviceFilter],
   );
 
   useEffect(() => {

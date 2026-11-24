@@ -3,7 +3,7 @@ import React from "react";
 type IconProps = { size?: number; className?: string };
 
 function make(paths: React.ReactNode) {
-  return ({ size = 18, className }: IconProps) => (
+  const IconComponent = ({ size = 18, className }: IconProps) => (
     <svg
       className={className}
       width={size}
@@ -20,6 +20,8 @@ function make(paths: React.ReactNode) {
       {paths}
     </svg>
   );
+  IconComponent.displayName = "Icon";
+  return IconComponent;
 }
 
 export const InboxIcon = make(
@@ -81,6 +83,7 @@ export const SearchIcon = make(
 export const CloseIcon = make(<path d="M18 6 6 18M6 6l12 12" />);
 export const ChevronLeftIcon = make(<path d="m15 18-6-6 6-6" />);
 export const ChevronRightIcon = make(<path d="m9 18 6-6-6-6" />);
+export const ChevronDownIcon = make(<path d="m6 9 6 6 6-6" />);
 export const CheckIcon = make(<path d="m5 12.5 4.5 4.5L19 7.5" />);
 export const AlertIcon = make(
   <>

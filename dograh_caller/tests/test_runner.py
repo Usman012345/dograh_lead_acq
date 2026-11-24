@@ -417,3 +417,88 @@ def test_create_app_default_runner_stays_idle_on_startup(tmp_path, monkeypatch):
         demo_runner = demo_client.get("/api/runner").json()
         assert demo_runner["state"] == "idle"
         assert demo_runner["source_url"] is None
+
+
+def test_starting_new_batch_clears_dashboard_to_only_new_batch_and_keeps_history(tmp_path):
+    from number_verifier import NumberVerifier
+    from pipeline_tracker import PipelineTracker
+
+    tracker_path = tmp_path / "pipeline_tracker.xlsx"
+    verifier = NumberVerifier()
+    # Seed an earlier completed batch in the tracker
+    t = PipelineTracker(tracker_path)
+    t.open()
+    try:
+        old_id = t.register({"lead_id": "old-1", "company": "Fictional Old Co", "phone": "(512) 555-0160"}, "streamer", batch_id="job_old")
+        t.record_verification(old_id, verifier.verify({"phone": "(512) 555-0160"}))
+        t.record_finished(old_id, "not_interested")
+        t.save()
+    finally:
+        t.close()
+
+    store = TrackerDataStore(tracker_path, start_watcher=False, demo=False)
+    allow_process = threading.Event()
+    in_process = threading.Event()
+
+    def fake_ping(url, token, timeout, limit=None):
+        return PingResult(BATCH, "Received 1", [{"lead_id": "new-1", "company": "Fictional New Co", "phone": "(512) 555-0161"}])
+
+    def fake_process(leads, *, batch_size=None, stop_event=None, tracker_file=None, batch_id=None, **kwargs):
+        in_process.set()
+        allow_process.wait(timeout=5.0)
+        tr = PipelineTracker(tracker_file or tracker_path)
+        tr.open()
+        try:
+            for ld in leads:
+                lid = tr.register(ld, "streamer", batch_id=batch_id or "")
+                tr.record_verification(lid, verifier.verify(ld))
+                tr.record_finished(lid, "not_interested")
+            tr.save()
+        finally:
+            tr.close()
+        return Counter(received=len(leads))
+
+    runner = BatchRunner(
+        store=store,
+        source_url="http://fake-proxy.local",
+        token="tok",
+        batches_dir=tmp_path / "pulled",
+        ping_fn=fake_ping,
+        process_fn=fake_process,
+        preflight_fn=lambda: None,
+    )
+    app = create_app(tracker_path=tracker_path, start_watcher=False, runner=runner)
+
+    with TestClient(app) as client:
+        # Before starting new job, latest batch (job_old) is shown
+        before = client.get("/api/summary").json()
+        assert before["selected_batch_id"] == "job_old"
+        assert before["nodes"]["incoming"]["total"] == 1
+
+        # Start new job -> gets unique batch_id, dashboard clears immediately to 0 for active batch
+        r_start = client.post("/api/runner/start", json={"batch_size": 1, "num_batches": 1})
+        assert r_start.status_code == 200
+        new_bid = r_start.json()["batch_id"]
+        assert new_bid and new_bid != "job_old"
+        assert in_process.wait(timeout=3.0)
+
+        mid = client.get("/api/summary").json()
+        assert mid["selected_batch_id"] == new_bid
+        assert mid["nodes"]["incoming"]["total"] == 0
+        assert [b["batch_id"] for b in mid["batches"]] == [new_bid, "job_old"]
+        assert mid["batches"][0]["is_active"] is True
+
+        # Previous batch is still accessible from the dropdown API while/after running
+        mid_old = client.get("/api/summary?batch_id=job_old").json()
+        assert mid_old["nodes"]["incoming"]["total"] == 1
+
+        # Finish new job -> dashboard shows ONLY the 1 new lead (not 2)
+        allow_process.set()
+        assert _wait_until(lambda: not client.get("/api/runner").json()["active"])
+
+        after = client.get("/api/summary").json()
+        assert after["selected_batch_id"] == new_bid
+        assert after["nodes"]["incoming"]["total"] == 1
+        assert [r["business"] for r in client.get("/api/leads?view=incoming").json()["rows"]] == ["Fictional New Co"]
+        assert [r["business"] for r in client.get("/api/leads?view=incoming&batch_id=job_old").json()["rows"]] == ["Fictional Old Co"]
+        assert client.get("/api/leads?view=incoming&batch_id=all").json()["total"] == 2

@@ -25,6 +25,8 @@ from pipeline_tracker import TRACKER_SHEET_NAME, plain_english_label, sanitize_d
 from results_store import _SYSTEM_CONTEXT_KEYS
 
 _LEAD_ID_NUM_RE = re.compile(r"^L(\d+)$")
+LEGACY_BATCH_ID = "__legacy__"
+ALL_BATCHES_ID = "all"
 # Only real script/data links: ordinary text such as "Data: 5 projects" must stay visible.
 _UNSAFE_SCHEME_RE = re.compile(
     r"^\s*(?:javascript\s*:|vbscript\s*:|data\s*:\s*[a-z]+/[a-z0-9.+-]+\s*[;,])",
@@ -162,6 +164,9 @@ def friendly_detail(row: Dict[str, Any]) -> str:
         return "The final call result did not arrive in time."
     if status == "call_failed":
         if str(row.get("dograh_run_id") or "").strip():
+            disposition = str(row.get("call_disposition") or "").strip()
+            if disposition:
+                return f"The call did not reach anyone ({outcome_label(disposition).lower()})."
             return "The call was attempted but did not complete."
         return "The call could not be started."
     return ""
@@ -282,6 +287,20 @@ def _as_int(value: Any) -> Optional[int]:
 def _lead_num(lead_id: Any) -> int:
     m = _LEAD_ID_NUM_RE.match(str(lead_id or "").strip())
     return int(m.group(1)) if m else 0
+
+
+def _row_batch_id(row: Dict[str, Any]) -> str:
+    val = str(row.get("batch_id") or "").strip()
+    return val or LEGACY_BATCH_ID
+
+
+def _filter_rows_by_batch(
+    rows: Tuple[Dict[str, Any], ...],
+    batch_id: Optional[str],
+) -> Tuple[Dict[str, Any], ...]:
+    if not batch_id or batch_id == ALL_BATCHES_ID:
+        return rows
+    return tuple(r for r in rows if _row_batch_id(r) == batch_id)
 
 
 def _format_duration(seconds: Any) -> str:
@@ -642,11 +661,132 @@ class TrackerDataStore:
             },
         }
 
-    def get_summary(self) -> Dict[str, Any]:
+    def _build_batches(self, rows: Tuple[Dict[str, Any], ...]) -> List[Dict[str, Any]]:
+        groups: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            bid = _row_batch_id(r)
+            g = groups.get(bid)
+            if g is None:
+                g = {
+                    "batch_id": bid,
+                    "started_at": None,
+                    "updated_at": None,
+                    "total_leads": 0,
+                    "qualified": 0,
+                    "called": 0,
+                    "transferred": 0,
+                    "in_progress": 0,
+                    "is_legacy": bid == LEGACY_BATCH_ID,
+                    "is_active": False,
+                    "_max_lead_num": 0,
+                }
+                groups[bid] = g
+
+            g["total_leads"] += 1
+            g["_max_lead_num"] = max(g["_max_lead_num"], _lead_num(r.get("lead_id")))
+            rec = str(r.get("received_at") or "").strip()
+            upd = str(r.get("updated_at") or "").strip() or rec
+            if rec and (g["started_at"] is None or rec < g["started_at"]):
+                g["started_at"] = rec
+            if upd and (g["updated_at"] is None or upd > g["updated_at"]):
+                g["updated_at"] = upd
+
+            if r.get("decision_result") == "qualified":
+                g["qualified"] += 1
+            stage = str(r.get("stage") or "").strip()
+            if stage == "call_finished" and r.get("call_status") == "called":
+                g["called"] += 1
+            elif stage in ("incoming", "awaiting_decision", "qualified_waiting", "calling"):
+                g["in_progress"] += 1
+            if _as_bool(r.get("call_transferred")):
+                g["transferred"] += 1
+
+        named = [g for bid, g in groups.items() if bid != LEGACY_BATCH_ID]
+        named.sort(key=lambda g: (g["started_at"] or "", g["_max_lead_num"], g["batch_id"]))
+        for idx, g in enumerate(named, start=1):
+            g["label"] = f"Batch #{idx}"
+            g.pop("_max_lead_num", None)
+
+        out = list(reversed(named))
+        if LEGACY_BATCH_ID in groups:
+            legacy = groups[LEGACY_BATCH_ID]
+            legacy["label"] = "Earlier runs"
+            legacy.pop("_max_lead_num", None)
+            out.append(legacy)
+        return out
+
+    def list_batches(self, *, active_batch: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         snap = self.snapshot()
-        if snap.summary:
-            return dict(snap.summary)
-        return self._build_summary(snap.tracker_found, snap.stale, snap.data_as_of, snap.rows)
+        batches = self._build_batches(snap.rows)
+        if active_batch and active_batch.get("active") and active_batch.get("batch_id"):
+            ab_id = str(active_batch["batch_id"]).strip()
+            if ab_id:
+                existing_idx = next((i for i, b in enumerate(batches) if b["batch_id"] == ab_id), None)
+                if existing_idx is not None:
+                    entry = dict(batches[existing_idx])
+                    entry["is_active"] = True
+                    del batches[existing_idx]
+                    batches.insert(0, entry)
+                else:
+                    next_num = sum(1 for b in batches if not b["is_legacy"]) + 1
+                    started = active_batch.get("started_at")
+                    batches.insert(0, {
+                        "batch_id": ab_id,
+                        "label": f"Batch #{next_num}",
+                        "started_at": started,
+                        "updated_at": started,
+                        "total_leads": 0,
+                        "qualified": 0,
+                        "called": 0,
+                        "transferred": 0,
+                        "in_progress": 0,
+                        "is_legacy": False,
+                        "is_active": True,
+                    })
+        return batches
+
+    def resolve_batch_id(
+        self,
+        requested: Optional[str],
+        *,
+        active_batch_id: Optional[str] = None,
+    ) -> Optional[str]:
+        if requested is not None:
+            req = requested.strip()
+            if req == ALL_BATCHES_ID:
+                return ALL_BATCHES_ID
+            if req:
+                return req
+        if active_batch_id:
+            ab = str(active_batch_id).strip()
+            if ab:
+                return ab
+        batches = self.list_batches()
+        return batches[0]["batch_id"] if batches else None
+
+    def get_summary(
+        self,
+        *,
+        batch_id: Optional[str] = None,
+        active_batch: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        snap = self.snapshot()
+        active_id = (
+            str(active_batch.get("batch_id") or "").strip()
+            if active_batch and active_batch.get("active")
+            else None
+        )
+        effective = self.resolve_batch_id(batch_id, active_batch_id=active_id)
+        batches = self.list_batches(active_batch=active_batch)
+        filtered_rows = _filter_rows_by_batch(snap.rows, effective)
+
+        if snap.summary and len(filtered_rows) == len(snap.rows):
+            summary = dict(snap.summary)
+        else:
+            summary = self._build_summary(snap.tracker_found, snap.stale, snap.data_as_of, filtered_rows)
+        summary["selected_batch_id"] = effective
+        summary["batches"] = batches
+        return summary
 
     # ------------------------------------------------------------------ /api/leads
 
@@ -954,9 +1094,13 @@ class TrackerDataStore:
         order: str = "asc",
         page: int = 1,
         page_size: int = 50,
+        batch_id: Optional[str] = None,
+        active_batch_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         snap = self.snapshot()
-        rows, columns = self._view_spec(view, snap.rows)
+        effective_batch = self.resolve_batch_id(batch_id, active_batch_id=active_batch_id)
+        scoped_rows = _filter_rows_by_batch(snap.rows, effective_batch)
+        rows, columns = self._view_spec(view, scoped_rows)
 
         if service:
             s_norm = service.strip()
@@ -1072,6 +1216,7 @@ class TrackerDataStore:
 
         return {
             "view": view,
+            "batch_id": effective_batch,
             "columns": columns,
             "rows": page_rows,
             "total": total,

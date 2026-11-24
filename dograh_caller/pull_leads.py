@@ -27,16 +27,18 @@ The streamer's side of the agreement: lead_streamer/LEAD_STREAMER_SPEC.md ยง7, ย
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import signal
 import sys
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 
@@ -160,8 +162,14 @@ def ping(base_url: str, token: str, timeout: float,
 class BatchStore:
     """
     output/pulled_batches/batch_<time>_<n>.pending.json   received, not fully processed yet
+    output/pulled_batches/batch_<time>_<n>.progress.json  which leads of it are already finished
     output/pulled_batches/batch_<time>_<n>.done.json      fully processed (kept as a record)
+
+    The progress file lets a stopped batch resume where it stopped: finished
+    leads (not called, called, ...) are not scored or called again.
     """
+
+    _progress_lock = threading.Lock()
 
     def __init__(self, folder: Path):
         self.folder = Path(folder)
@@ -197,9 +205,47 @@ class BatchStore:
         return doc
 
     @staticmethod
-    def mark_done(path: Path) -> Path:
+    def progress_path(path: Path) -> Path:
+        return Path(path).with_name(Path(path).name.replace(".pending.json", ".progress.json"))
+
+    @classmethod
+    def load_progress(cls, path: Path) -> Set[int]:
+        """Indexes (in the batch's lead list) of the leads already finished."""
+        p = cls.progress_path(path)
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return set()
+        done = data.get("done") if isinstance(data, dict) else None
+        return {int(i) for i in done or [] if isinstance(i, int) or str(i).isdigit()}
+
+    @classmethod
+    def add_progress(cls, path: Path, indexes: Iterable[int]) -> None:
+        new = {int(i) for i in indexes}
+        if not new:
+            return
+        with cls._progress_lock:
+            done = cls.load_progress(path) | new
+            p = cls.progress_path(path)
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(json.dumps({"done": sorted(done)}), encoding="utf-8")
+            os.replace(tmp, p)
+
+    @classmethod
+    def remaining(cls, path: Path) -> Tuple[Dict[str, Any], List[int]]:
+        """(the batch document, indexes of its leads not finished yet)."""
+        doc = cls.load(path)
+        done = cls.load_progress(path)
+        return doc, [i for i in range(len(doc["leads"])) if i not in done]
+
+    @classmethod
+    def mark_done(cls, path: Path) -> Path:
         done = path.with_name(path.name.replace(".pending.json", ".done.json"))
         os.replace(path, done)
+        try:
+            cls.progress_path(path).unlink(missing_ok=True)
+        except OSError:
+            pass
         return done
 
 
@@ -220,12 +266,30 @@ def say(message: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {'source':<8} {message}", flush=True)
 
 
-def save_failed_for_retry(failed: List[Dict[str, Any]], batches_dir: Optional[Path] = None) -> Path:
-    """Keep leads Gemini could not score as a pending batch, so they are processed again."""
+def save_failed_for_retry(failed: List[Dict[str, Any]], batches_dir: Optional[Path] = None,
+                          source: str = "decision_retry") -> Path:
+    """
+    Keep leads as a new pending batch, so a later run processes them again:
+    source "decision_retry" = Gemini could not score them, "call_retry" = their call failed.
+    """
     folder = Path(batches_dir) if batches_dir is not None else config.PULLED_BATCHES_DIR
-    retry_path = BatchStore(folder).save(PingResult(BATCH, leads=failed), "decision_retry")
-    say(f"Saved {len(failed)} failed-decision lead(s) for retry -> {retry_path.name}")
+    retry_path = BatchStore(folder).save(PingResult(BATCH, leads=failed), source)
+    what = "failed-decision" if source == "decision_retry" else "failed-call"
+    say(f"Saved {len(failed)} {what} lead(s) for retry -> {retry_path.name}")
     return retry_path
+
+
+def call_with_supported_kwargs(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Call fn with only the keyword arguments it accepts (process functions differ)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return fn(*args)
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return fn(*args, **kwargs)
+    accepted = {k: v for k, v in kwargs.items()
+                if k in params and params[k].kind != inspect.Parameter.POSITIONAL_ONLY}
+    return fn(*args, **accepted)
 
 
 def default_process(
@@ -237,12 +301,38 @@ def default_process(
     stop_event: Optional[Any] = None,
     batches_dir: Optional[Path] = None,
     tracker_file: Optional[Path] = None,
+    batch_id: Optional[str] = None,
+    progress_path: Optional[Path] = None,
+    lead_indexes: Optional[List[int]] = None,
+    retry_failed_calls: Optional[bool] = None,
 ) -> Counter:
+    """
+    Run one batch of leads through the pipeline.
+
+    progress_path / lead_indexes: the saved batch file and the index of each of
+    `leads` in it; every lead that finishes is recorded, so a stopped batch
+    resumes with only the unfinished leads.
+    retry_failed_calls: also save leads whose call reached nobody for a new
+    try (default RETRY_FAILED_CALLS). Never-dialed leads are always saved.
+    """
     from pipeline import run_leads_sync
     failed: List[Dict[str, Any]] = []
+    call_retry: List[Dict[str, Any]] = []
     extra_kwargs: Dict[str, Any] = {}
     if tracker_file is not None:
         extra_kwargs["tracker_file"] = tracker_file
+    if batch_id:
+        extra_kwargs["batch_id"] = batch_id
+    if retry_failed_calls is not None:
+        extra_kwargs["retry_failed_calls"] = retry_failed_calls
+    if progress_path is not None:
+        indexes = list(lead_indexes) if lead_indexes is not None else list(range(len(leads)))
+
+        def on_lead_final(position: int, _status: str) -> None:
+            if 0 <= position < len(indexes):
+                BatchStore.add_progress(progress_path, [indexes[position]])
+
+        extra_kwargs["on_lead_final"] = on_lead_final
     stats = run_leads_sync(
         leads,
         batch_size=batch_size or config.LEAD_BATCH_SIZE,
@@ -250,11 +340,17 @@ def default_process(
         threshold=threshold,
         results_file=output,
         failed_leads=failed,
+        retry_leads=call_retry,
         source_label="streamer",
         **extra_kwargs,
     )
-    if failed and not (stop_event is not None and stop_event.is_set()):
-        save_failed_for_retry(failed, batches_dir=batches_dir)
+    # After a Stop the whole unfinished batch is resumed later, these leads included
+    # (they are not marked finished), so saving them now would process them twice.
+    if not (stop_event is not None and stop_event.is_set()):
+        if failed:
+            save_failed_for_retry(failed, batches_dir=batches_dir, source="decision_retry")
+        if call_retry:
+            save_failed_for_retry(call_retry, batches_dir=batches_dir, source="call_retry")
     return stats
 
 
@@ -335,8 +431,15 @@ class Puller:
     def _run_batch(self, path: Path, auto: bool = False) -> str:
         """Process one saved batch completely. Returns 'done', 'later', 'failed' (auto) or 'quit'."""
         while True:
-            doc = self.store.load(path)
-            leads = doc["leads"]
+            doc, indexes = self.store.remaining(path)
+            if not indexes:
+                done = self.store.mark_done(path)
+                say(f"Every lead of {path.name} was already finished -> {done.name}")
+                return "done"
+            leads = [doc["leads"][i] for i in indexes]
+            if len(indexes) < len(doc["leads"]):
+                say(f"Resuming {path.name}: {len(doc['leads']) - len(indexes)} lead(s) were already finished "
+                    f"and are skipped")
             if len(leads) > config.LEAD_BATCH_SIZE:
                 say(f"WARNING: the streamer sent {len(leads)} leads, more than LEAD_BATCH_SIZE="
                     f"{config.LEAD_BATCH_SIZE}. Set BATCH_SIZE={config.LEAD_BATCH_SIZE} in the streamer's "
@@ -344,7 +447,8 @@ class Puller:
                     "the streamer has already marked them as sent.")
             say(f"Processing {len(leads)} lead(s) from {path.name} - LIVE: qualified leads will be called")
             try:
-                self.last_stats = self.process(leads) or {}
+                self.last_stats = call_with_supported_kwargs(
+                    self.process, leads, progress_path=path, lead_indexes=indexes) or {}
             except KeyboardInterrupt:
                 print()
                 say(f"Stopped by user. This run's campaigns were paused. The batch is kept in {path} "
@@ -364,6 +468,7 @@ class Puller:
                     if answer == "":
                         break
                 continue
+            self.store.add_progress(path, indexes)
             done = self.store.mark_done(path)
             self.batches_done += 1
             self.leads_done += len(leads)
@@ -374,7 +479,7 @@ class Puller:
         # 1. Batches received earlier but not fully processed (crash, Ctrl+C, error)
         for path in self.store.unfinished():
             try:
-                n = len(self.store.load(path)["leads"])
+                n = len(self.store.remaining(path)[1])
             except (OSError, ValueError) as e:
                 say(f"WARNING: cannot read {path.name} ({e}); leaving it alone")
                 continue
@@ -473,7 +578,8 @@ class Puller:
                     outcome = self._run_batch(path, auto=True)
                     if outcome == "quit":
                         return self._bye(130)
-                    if outcome == "failed" or self.last_stats.get("decision_error"):
+                    if (outcome == "failed" or self.last_stats.get("decision_error")
+                            or self.last_stats.get("retry_saved_call")):
                         failures += 1
                         wait = min(check_seconds * 2 ** (failures - 1), MAX_AUTO_BACKOFF_SECONDS)
                         say(f"Retrying unfinished leads in {wait:.0f}s. No new leads are taken until then.")
@@ -630,6 +736,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--output", help=f"Results .xlsx (default {config.RESULTS_FILE})")
     parser.add_argument("--check", action="store_true",
                         help="Only test keys, Dograh agents and the streamer (token included); take no leads")
+    parser.add_argument("--retry-failed-calls", action=argparse.BooleanOptionalAction, default=None,
+                        help="Save leads whose call reached nobody (busy, no answer, failed, voicemail) and call "
+                             f"them again in a later batch (default RETRY_FAILED_CALLS={config.RETRY_FAILED_CALLS})")
     args = parser.parse_args(argv)
 
     active_threshold = config.INTEREST_THRESHOLD if args.threshold is None else args.threshold
@@ -658,9 +767,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         token=config.LEAD_SOURCE_TOKEN,
         timeout=config.LEAD_SOURCE_TIMEOUT,
         store=BatchStore(config.PULLED_BATCHES_DIR),
-        process=lambda leads: default_process(leads, args.threshold, args.output),
+        process=lambda leads, **kw: call_with_supported_kwargs(
+            default_process, leads, args.threshold, args.output,
+            retry_failed_calls=args.retry_failed_calls, **kw),
     )
+    retry_calls = config.RETRY_FAILED_CALLS if args.retry_failed_calls is None else args.retry_failed_calls
     print(f"Lead source (reverse proxy): {puller.source_url} | batch size {config.LEAD_BATCH_SIZE} | "
+          f"retry failed calls: {'yes' if retry_calls else 'no'} | "
           "idle until you press Enter to pull a batch", flush=True)
     return puller.run(confirm_first=True)
 

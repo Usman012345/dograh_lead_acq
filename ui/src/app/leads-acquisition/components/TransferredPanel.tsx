@@ -1,6 +1,7 @@
 import React from "react";
-import { OpenLeadRequest, ServiceInfo, TransferredRow } from "../types";
+
 import { formatDateTime, serviceColor } from "../lib/format";
+import { OpenLeadRequest, ServiceInfo, TransferredRow } from "../types";
 import { CloseIcon, PhoneForwardIcon } from "./Icons";
 
 interface Props {

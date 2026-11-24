@@ -525,3 +525,39 @@ def test_float_string_times_processed_reloaded_cleanly(tmp_path):
         assert t2._by_lead_id[reused]["times_processed"] == 2
     finally:
         t2.close()
+
+
+def test_batch_id_round_trip_preserves_previous_batch_and_called_numbers(tmp_path):
+    tracker_path = tmp_path / "tracker.xlsx"
+    verifier = NumberVerifier()
+
+    t1 = PipelineTracker(tracker_path)
+    t1.open()
+    id_b1_nq = t1.register({"lead_id": "b-1", "company": "Fictional B1 NQ", "phone": "(512) 555-0141"}, "streamer", batch_id="job_1")
+    id_b1_called = t1.register({"lead_id": "b-2", "company": "Fictional B1 Called", "phone": "(512) 555-0142"}, "streamer", batch_id="job_1")
+    t1.record_verification(id_b1_nq, verifier.verify({"phone": "(512) 555-0141"}))
+    t1.record_finished(id_b1_nq, "not_interested")
+    t1.record_verification(id_b1_called, verifier.verify({"phone": "(512) 555-0142"}))
+    t1.record_campaign(id_b1_called, Agent(3, "Olivia", "published"), 10, "Camp")
+    t1.record_call_started(id_b1_called, 501, 1)
+    t1.record_finished(id_b1_called, "called", "", CallOutcome(status="called", run_id=501, attempts=1))
+    assert t1.save() is True
+    t1.close()
+
+    # Second batch with different batch_id creates a new row even for b-1 (no overwrite)
+    # and still remembers +15125550142 in called_numbers().
+    t2 = PipelineTracker(tracker_path)
+    t2.open()
+    try:
+        assert "+15125550142" in t2.called_numbers()
+        id_b2_nq = t2.register({"lead_id": "b-1", "company": "Fictional B1 NQ Again", "phone": "(512) 555-0141"}, "streamer", batch_id="job_2")
+        assert id_b2_nq != id_b1_nq
+        assert t2._by_lead_id[id_b1_nq]["batch_id"] == "job_1"
+        assert t2._by_lead_id[id_b2_nq]["batch_id"] == "job_2"
+        assert t2._by_lead_id[id_b2_nq]["previous_lead_id"] == id_b1_nq
+        assert t2.save() is True
+    finally:
+        t2.close()
+
+    _, rows = _read_tracker(tracker_path)
+    assert [r["batch_id"] for r in rows] == ["job_1", "job_1", "job_2"]

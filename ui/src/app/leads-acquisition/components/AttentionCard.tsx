@@ -1,4 +1,5 @@
 import React from "react";
+
 import { OpenViewRequest, SummaryResponse, ViewName } from "../types";
 import { AlertIcon, BadgeCheckIcon, ChevronRightIcon } from "./Icons";
 

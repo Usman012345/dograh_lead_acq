@@ -35,6 +35,7 @@ export type RunnerState = "idle" | "running" | "stopping" | "completed" | "stopp
 export interface RunnerStatus {
   state: RunnerState;
   active: boolean;
+  batch_id?: string | null;
   batch_size: number;
   total_batches: number;
   current_batch: number;
@@ -47,6 +48,25 @@ export interface RunnerStatus {
   message: string;
   error: string | null;
   source_url?: string | null;
+  /** Leads whose call reached nobody are called again in a later batch */
+  retry_failed_calls?: boolean;
+  /** Saved batches from earlier runs (processed first) and their unfinished leads */
+  pending_batches?: number;
+  pending_leads?: number;
+}
+
+export interface BatchInfo {
+  batch_id: string;
+  label: string;
+  started_at: string | null;
+  updated_at: string | null;
+  total_leads: number;
+  qualified: number;
+  called: number;
+  transferred: number;
+  in_progress: number;
+  is_legacy: boolean;
+  is_active: boolean;
 }
 
 export interface SummaryResponse {
@@ -66,6 +86,8 @@ export interface SummaryResponse {
   };
   nodes: SummaryNodes;
   runner?: RunnerStatus;
+  selected_batch_id?: string | null;
+  batches?: BatchInfo[];
 }
 
 export interface OpenViewRequest {

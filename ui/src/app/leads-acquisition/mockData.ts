@@ -1,4 +1,33 @@
-import { LeadDetailResponse, LeadsResponse, SummaryResponse, TransferredRow } from "./types";
+import { BatchInfo, LeadDetailResponse, SummaryResponse, TransferredRow } from "./types";
+
+export const DEMO_BATCHES: BatchInfo[] = [
+  {
+    batch_id: "batch_20261124_02",
+    label: "Batch #2 (Austin Commercial GCs)",
+    started_at: new Date(Date.now() - 45 * 60000).toISOString(),
+    updated_at: new Date(Date.now() - 5 * 60000).toISOString(),
+    total_leads: 500,
+    qualified: 310,
+    called: 240,
+    transferred: 68,
+    in_progress: 12,
+    is_legacy: false,
+    is_active: false,
+  },
+  {
+    batch_id: "batch_20261124_01",
+    label: "Batch #1 (Initial Test Run)",
+    started_at: new Date(Date.now() - 180 * 60000).toISOString(),
+    updated_at: new Date(Date.now() - 90 * 60000).toISOString(),
+    total_leads: 750,
+    qualified: 410,
+    called: 322,
+    transferred: 80,
+    in_progress: 0,
+    is_legacy: true,
+    is_active: false,
+  },
+];
 
 export const DEMO_SUMMARY: SummaryResponse = {
   tracker_found: true,
@@ -7,6 +36,8 @@ export const DEMO_SUMMARY: SummaryResponse = {
   data_as_of: new Date().toISOString(),
   refresh_seconds: 5,
   threshold: 0.8,
+  selected_batch_id: "batch_20261124_02",
+  batches: DEMO_BATCHES,
   services: [
     { id: "commercial_estimating", name: "Commercial Estimating" },
     { id: "residential_estimating", name: "Residential Estimating" },
@@ -47,6 +78,7 @@ export const DEMO_SUMMARY: SummaryResponse = {
   runner: {
     state: "idle",
     active: false,
+    batch_id: "batch_20261124_02",
     batch_size: 300,
     total_batches: 5,
     current_batch: 5,
@@ -54,6 +86,9 @@ export const DEMO_SUMMARY: SummaryResponse = {
     leads_fetched: 1250,
     leads_processed: 1250,
     current_batch_leads: 0,
+    retry_failed_calls: false,
+    pending_batches: 0,
+    pending_leads: 0,
     started_at: new Date(Date.now() - 3600000).toISOString(),
     finished_at: new Date(Date.now() - 600000).toISOString(),
     message: "Completed all batches",

@@ -23,8 +23,9 @@ import re
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -127,18 +128,29 @@ class DograhClient:
             self._agents[agent_id] = agent
         return agent
 
+    def _published_workflow(self, agent_id: int) -> Dict[str, Any]:
+        versions = self._json(self._request("GET", f"/workflow/{agent_id}/versions"),
+                              f"Fetching versions of agent {agent_id}")
+        if isinstance(versions, dict):          # tolerate a wrapped list
+            versions = versions.get("versions") or versions.get("items") or []
+        if not isinstance(versions, list):
+            return {}
+        published = next((v for v in versions if isinstance(v, dict) and v.get("status") == "published"), None)
+        return (published or {}).get("workflow_json") or {}
+
     def get_required_variables(self, agent_id: int) -> Set[str]:
         """
         Template variables the agent's PUBLISHED version needs from the contact
         list. Dograh refuses a campaign if any of these columns is missing or
         empty in any row.
         """
-        versions = self._json(self._request("GET", f"/workflow/{agent_id}/versions"),
-                              f"Fetching versions of agent {agent_id}")
-        published = next((v for v in versions if v.get("status") == "published"), None)
-        if not published:
-            return set()
-        return required_template_variables(published.get("workflow_json") or {})
+        return required_template_variables(self._published_workflow(agent_id))
+
+    def get_agent_variables(self, agent_id: int) -> Tuple[Set[str], Set[str]]:
+        """(required, used): the variables a campaign CSV must fill, and every
+        lead variable the published agent refers to anywhere (with or without a default)."""
+        workflow = self._published_workflow(agent_id)
+        return required_template_variables(workflow), used_template_variables(workflow)
 
     # -- campaigns -------------------------------------------------------------
 
@@ -247,6 +259,11 @@ _TEMPLATE_VAR_RE = re.compile(r"\{\{\s*([^|\s}]+)(?:\s*\|\s*([^:}]+)(?::([^}]+))
 _SYSTEM_VARIABLES = {"campaign_id", "provider", "source_uuid"}
 
 
+def _is_builtin_variable(name: str) -> bool:
+    """current_time / current_weekday (and their _<Area/City> forms) are computed by Dograh at call time."""
+    return name in ("current_time", "current_weekday") or name.startswith(("current_time_", "current_weekday_"))
+
+
 def required_template_variables(workflow_json: Dict[str, Any]) -> Set[str]:
     """Variables in prompts / greetings / transition speeches that need a CSV value."""
     texts: List[str] = []
@@ -258,14 +275,67 @@ def required_template_variables(workflow_json: Dict[str, Any]) -> Set[str]:
 
     required: Set[str] = set()
     for text in texts:
+        if not isinstance(text, str):
+            continue
         for m in _TEMPLATE_VAR_RE.finditer(text):
             name, has_filter = m.group(1).strip(), m.group(2) is not None
             if "." in name or has_filter or name in _SYSTEM_VARIABLES:
                 continue  # nested path, has a default, or filled in by Dograh
-            if name in ("current_time", "current_weekday") or name.startswith(("current_time_", "current_weekday_")):
+            if _is_builtin_variable(name):
                 continue  # computed by Dograh at call time
             required.add(name)
     return required
+
+
+def _walk_strings(value: Any) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from _walk_strings(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from _walk_strings(v)
+
+
+def used_template_variables(workflow_json: Dict[str, Any]) -> Set[str]:
+    """
+    Every lead variable the agent refers to ANYWHERE in its workflow (prompts,
+    greetings, tool settings, ...), with or without a default:
+    {{company}}, {{city | there}}, {{initial_context.city}} -> company, city.
+    """
+    used: Set[str] = set()
+    for text in _walk_strings(workflow_json or {}):
+        if "{{" not in text:
+            continue
+        for m in _TEMPLATE_VAR_RE.finditer(text):
+            name = m.group(1).strip()
+            if name.startswith("initial_context."):
+                name = name[len("initial_context."):]
+            name = name.split(".", 1)[0]
+            if name and name not in _SYSTEM_VARIABLES and not _is_builtin_variable(name):
+                used.add(name)
+    return used
+
+
+# Dograh's campaign-creation errors that name variables its contact check wanted
+_MISSING_COLUMNS_RE = re.compile(r"missing from the source data:\s*(.+?)(?:\.\s|\.$|$)", re.IGNORECASE)
+_EMPTY_VARIABLE_RE = re.compile(r"Template variable '([^']+)' is empty", re.IGNORECASE)
+
+
+def variables_in_campaign_error(message: str) -> Set[str]:
+    """
+    Variable names in a Dograh campaign-creation error about the contacts file:
+      "Workflow uses template variables that are missing from the source data: 'city', 'zip'. ..."
+      "Template variable 'city' is empty in rows: 2, 5. ..."
+    Empty set for any other error.
+    """
+    text = str(message or "")
+    found: Set[str] = set(_EMPTY_VARIABLE_RE.findall(text))
+    m = _MISSING_COLUMNS_RE.search(text)
+    if m:
+        found |= set(re.findall(r"'([^']+)'", m.group(1)))
+    return {v.strip().lower() for v in found if v.strip()}
 
 
 def run_disposition(run: Dict[str, Any]) -> Optional[str]:
@@ -299,7 +369,17 @@ def is_transferred(run: Dict[str, Any]) -> bool:
     return False
 
 
+def is_not_reached(disposition: Optional[str]) -> bool:
+    """True if the call's outcome means nobody was reached (busy, no answer, failed, voicemail, ...)."""
+    return str(disposition or "").strip().lower() in config.NOT_REACHED_DISPOSITIONS
+
+
 def outcome_from_run(run: Dict[str, Any], attempts: int = 1) -> CallOutcome:
+    """
+    The outcome of a lead's last call attempt. A call that reached nobody
+    (see config.NOT_REACHED_DISPOSITIONS) is "call_failed", never "called", so
+    its number is not treated as already called. A transferred call is always "called".
+    """
     g = run.get("gathered_context") or {}
     cost = run.get("cost_info") or {}
     duration = cost.get("call_duration_seconds", cost.get("duration"))
@@ -308,15 +388,20 @@ def outcome_from_run(run: Dict[str, Any], attempts: int = 1) -> CallOutcome:
     except (TypeError, ValueError):
         duration = None
     tags = g.get("call_tags") or []
+    disposition = run_disposition(run)
+    status, error = "called", None
+    if is_not_reached(disposition) and not is_transferred(run):
+        status, error = "call_failed", f"Call did not reach anyone ({disposition})"
     return CallOutcome(
-        status="called",
+        status=status,
         run_id=run.get("id"),
-        disposition=run_disposition(run),
+        disposition=disposition,
         duration_seconds=duration,
         tags=tags if isinstance(tags, list) else [tags],
         transcript_url=run.get("transcript_public_url") or run.get("transcript_url"),
         recording_url=run.get("recording_public_url") or run.get("recording_url"),
         attempts=attempts,
+        error=error,
         raw={k: v for k, v in run.items() if k != "logs"},
     )
 
@@ -326,18 +411,68 @@ def safe_key(key: Any) -> str:
     return "".join(c if c.isalnum() else "_" for c in str(key).strip().lower()).strip("_")
 
 
-def call_context(lead: Dict[str, Any], phone_e164: str, service_name: str) -> Dict[str, Any]:
+def _lead_zone(time_zone: str) -> Optional[ZoneInfo]:
+    """The first IANA zone of a phone_timezone value ("America/Chicago" or "America/Chicago, America/Denver")."""
+    name = str(time_zone or "").split(",")[0].strip()
+    if not name:
+        return None
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return None
+
+
+# Variables this program always fills in itself (a lead field with one of these names is replaced)
+OWN_CONTEXT_KEYS = frozenset({"phone_number", "interested_service", "current_datetime", "current_date",
+                              "lead_timezone", "lead_ref"})
+
+
+def call_context(
+    lead: Dict[str, Any],
+    phone_e164: str,
+    service_name: str,
+    *,
+    fields: Optional[Iterable[str]] = None,
+    time_zone: str = "",
+    collisions: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """
     Variables passed to the Dograh agent (as campaign CSV columns). They can be
     used in the agent's prompts as {{template_variables}}, e.g. {{company}} or
     {{interested_service}}.
+
+    fields:     only these lead fields (CSV names, e.g. "company_name") are sent;
+                None = every lead field.
+    time_zone:  the number's IANA time zone (phone_timezone): current_datetime /
+                current_date are given in the LEAD's local time. They are fixed
+                when the campaign is created; for the time at the moment of the
+                call use Dograh's {{current_time_<Area/City>}}.
+    collisions: receives a warning for each pair of lead fields that map to the
+                same variable ("Company Name" and "company_name"); the first
+                non-empty value is kept.
     """
+    wanted = None if fields is None else {str(f).strip().lower() for f in fields}
     ctx: Dict[str, Any] = {}
+    origin: Dict[str, str] = {}
     for key, value in lead.items():
         k = safe_key(key)
-        if k and value not in (None, ""):
-            ctx[k] = value if isinstance(value, (str, int, float, bool)) else json.dumps(value, default=str)
+        if not k or value in (None, "") or k in OWN_CONTEXT_KEYS:
+            continue
+        if wanted is not None and k not in wanted:
+            continue
+        if k in ctx:
+            if collisions is not None:
+                collisions.append(f"lead fields '{origin[k]}' and '{key}' are both sent as {{{{{k}}}}}; "
+                                  f"keeping the value of '{origin[k]}'")
+            continue
+        ctx[k] = value if isinstance(value, (str, int, float, bool)) else json.dumps(value, default=str)
+        origin[k] = str(key)
+    zone = _lead_zone(time_zone)
+    now = datetime.now(zone) if zone is not None else datetime.now().astimezone()
     ctx["phone_number"] = phone_e164
     ctx["interested_service"] = service_name
-    ctx["current_datetime"] = datetime.now().astimezone().strftime("%A, %B %d, %Y, %I:%M %p %Z")
+    ctx["current_datetime"] = now.strftime("%A, %B %d, %Y, %I:%M %p %Z")
+    ctx["current_date"] = now.strftime("%A, %B %d, %Y")
+    if zone is not None:
+        ctx["lead_timezone"] = str(zone.key)
     return ctx

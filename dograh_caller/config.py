@@ -2,23 +2,36 @@
 Central configuration for dograh_caller.
 
 Every value can be overridden with an environment variable or a line in a
-`.env` file (looked up in this folder first, then in its parent folder).
+`.env` file. The `.env` in this folder is used; the parent folder's `.env` is
+read only when this folder has none (the two are never mixed, so keys from two
+different Dograh deployments can't end up combined).
 Secrets (API keys) should ONLY live in `.env`, never in code.
+
+Relative paths in settings (RESULTS_FILE=output/call_results.xlsx, ...) are
+relative to this folder, whatever folder the program is started from.
 """
 
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
-# .env in this folder wins over .env in the parent folder; real environment
-# variables win over both.
-load_dotenv(PROJECT_DIR / ".env", override=False)
-load_dotenv(PROJECT_DIR.parent / ".env", override=False)
+# Real environment variables win over the .env file. Only ONE .env file is
+# read: this folder's, or - only if this folder has none - the parent folder's.
+_LOCAL_ENV = PROJECT_DIR / ".env"
+_PARENT_ENV = PROJECT_DIR.parent / ".env"
+ENV_FILE: Optional[Path] = _LOCAL_ENV if _LOCAL_ENV.is_file() else (_PARENT_ENV if _PARENT_ENV.is_file() else None)
+if ENV_FILE is not None:
+    load_dotenv(ENV_FILE, override=False)
+
+_TRUE_WORDS = frozenset({"1", "true", "yes", "y", "on", "t"})
+_FALSE_WORDS = frozenset({"0", "false", "no", "n", "off", "f"})
 
 
 def _env(name: str, default: str = "", *aliases: str) -> str:
@@ -43,6 +56,32 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """true/yes/on/1 or false/no/off/0 (any case). Anything else keeps the default, with a warning."""
+    raw = _env(name, "")
+    if not raw:
+        return default
+    word = raw.lower()
+    if word in _TRUE_WORDS:
+        return True
+    if word in _FALSE_WORDS:
+        return False
+    print(f"WARNING: {name}={raw!r} is not true/false (use true/false, yes/no, on/off or 1/0); "
+          f"using the default ({'true' if default else 'false'}).", file=sys.stderr)
+    return default
+
+
+def project_path(value: "str | Path") -> Path:
+    """A path from a setting: relative paths are relative to this folder, not the current directory."""
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else PROJECT_DIR / path
+
+
+def _env_path(name: str, default: Path) -> Path:
+    raw = _env(name, "")
+    return project_path(raw) if raw else default
+
+
 # ------------------------------------------------------------------------------
 # Number verifier
 # ------------------------------------------------------------------------------
@@ -54,7 +93,7 @@ ALLOWED_PHONE_REGIONS = [r for r in _env("ALLOWED_PHONE_REGIONS", "US").split(",
 
 # Never call a number again that an earlier run already called (read from the
 # results sheet at startup: rows with status "called" or "call_timeout").
-SKIP_ALREADY_CALLED: bool = _env("SKIP_ALREADY_CALLED", "true").lower() not in ("0", "false", "no")
+SKIP_ALREADY_CALLED: bool = _env_bool("SKIP_ALREADY_CALLED", True)
 
 # ------------------------------------------------------------------------------
 # Gemini - decision maker
@@ -75,15 +114,27 @@ LEAD_MAX_FIELD_CHARS: int = _env_int("LEAD_MAX_FIELD_CHARS", _env_int("JEV_MAX_F
 LEAD_MAX_STATE_CHARS: int = _env_int("LEAD_MAX_STATE_CHARS", _env_int("JEV_MAX_STATE_CHARS", 12000))
 
 # Where services (DraftLiner, Paradise, ...) are described. See SERVICES.md.
-SERVICES_FILE: Path = Path(_env("SERVICES_FILE", str(PROJECT_DIR / "services.yaml")))
+SERVICES_FILE: Path = _env_path("SERVICES_FILE", PROJECT_DIR / "services.yaml")
 
 # ------------------------------------------------------------------------------
 # Dograh - calling agents
 # ------------------------------------------------------------------------------
 DOGRAH_API_KEY: str = _env("DOGRAH_API_KEY")
 DOGRAH_BASE_URL: str = _env("DOGRAH_BASE_URL", "https://dograh.grobots.ai/api/v1").rstrip("/")
-VERIFY_SSL: bool = _env("DOGRAH_VERIFY_SSL", "true").lower() not in ("0", "false", "no")
+VERIFY_SSL: bool = _env_bool("DOGRAH_VERIFY_SSL", True)
 REQUEST_TIMEOUT: int = _env_int("DOGRAH_REQUEST_TIMEOUT", 30)
+
+# --- What the contacts CSV sends to the agent ----------------------------------
+# By default only the {{variables}} the agent's published version uses, plus
+# these lead fields (comma-separated, names as in the CSV: lower case, "_").
+DOGRAH_EXTRA_FIELDS = [
+    f.strip().lower() for f in _env(
+        "DOGRAH_EXTRA_FIELDS",
+        "company,company_name,business_name,contact_name,contact_title,category,industry,city,state,location,lead_id",
+    ).split(",") if f.strip()
+]
+# true = send every lead field (the old behaviour: big text fields, e-mails, ...).
+DOGRAH_SEND_ALL_FIELDS: bool = _env_bool("DOGRAH_SEND_ALL_FIELDS", False)
 
 # --- Campaigns ---------------------------------------------------------------
 # Each run creates one Dograh campaign per service that has interested leads,
@@ -91,18 +142,44 @@ REQUEST_TIMEOUT: int = _env_int("DOGRAH_REQUEST_TIMEOUT", 30)
 CAMPAIGN_NAME_DATE_FORMAT: str = _env("CAMPAIGN_NAME_DATE_FORMAT", "%Y-%m-%d")
 
 # Retry settings sent with each new campaign (Dograh handles the retries).
-CAMPAIGN_RETRY_ENABLED: bool = _env("CAMPAIGN_RETRY_ENABLED", "true").lower() not in ("0", "false", "no")
+CAMPAIGN_RETRY_ENABLED: bool = _env_bool("CAMPAIGN_RETRY_ENABLED", True)
 CAMPAIGN_MAX_RETRIES: int = _env_int("CAMPAIGN_MAX_RETRIES", 1)
 CAMPAIGN_RETRY_DELAY_SECONDS: int = _env_int("CAMPAIGN_RETRY_DELAY_SECONDS", 120)
-CAMPAIGN_RETRY_ON_BUSY: bool = _env("CAMPAIGN_RETRY_ON_BUSY", "true").lower() not in ("0", "false", "no")
-CAMPAIGN_RETRY_ON_NO_ANSWER: bool = _env("CAMPAIGN_RETRY_ON_NO_ANSWER", "true").lower() not in ("0", "false", "no")
-CAMPAIGN_RETRY_ON_VOICEMAIL: bool = _env("CAMPAIGN_RETRY_ON_VOICEMAIL", "false").lower() not in ("0", "false", "no")
+CAMPAIGN_RETRY_ON_BUSY: bool = _env_bool("CAMPAIGN_RETRY_ON_BUSY", True)
+CAMPAIGN_RETRY_ON_NO_ANSWER: bool = _env_bool("CAMPAIGN_RETRY_ON_NO_ANSWER", True)
+CAMPAIGN_RETRY_ON_VOICEMAIL: bool = _env_bool("CAMPAIGN_RETRY_ON_VOICEMAIL", False)
 
 # Seconds between progress checks of running campaigns.
 CAMPAIGN_POLL_SECONDS: int = _env_int("CAMPAIGN_POLL_SECONDS", 5)
 # If a campaign makes no progress (no new call, no finished call) for this
-# long, its remaining leads are recorded as call_timeout and monitoring stops.
+# long while NO call is in progress, its remaining leads are recorded
+# (dialed -> call_timeout, never dialed -> call_failed) and monitoring stops.
 CAMPAIGN_IDLE_TIMEOUT_SECONDS: int = _env_int("CAMPAIGN_IDLE_TIMEOUT_SECONDS", 900)
+# A call still in progress counts as progress (a transferred call can last long)
+# until it has been going for this long; after that it is treated as stuck.
+CAMPAIGN_MAX_CALL_SECONDS: int = _env_int("CAMPAIGN_MAX_CALL_SECONDS", 3600)
+# After a Stop, wait this long after pausing a campaign before the last look at
+# its calls (so a call Dograh started at that moment is still recorded).
+STOP_SYNC_SECONDS: float = _env_float("STOP_SYNC_SECONDS", 2.0)
+
+# Call outcomes (dispositions) that mean nobody was reached. Such a call is
+# recorded as call_failed (not "called"), its number is not blocked for later
+# runs, and with RETRY_FAILED_CALLS it is queued to be called again.
+NOT_REACHED_DISPOSITIONS = frozenset(
+    d.strip().lower() for d in _env(
+        "NOT_REACHED_DISPOSITIONS",
+        "busy,no-answer,no_answer,failed,error,canceled,cancelled,voicemail,machine",
+    ).split(",") if d.strip()
+)
+# Default for the "retry failed calls" option (dashboard Start Batch, --retry-failed-calls):
+# leads whose call did not reach anyone are saved and called again in a later batch.
+# Leads that were never dialed (campaign could not start, ...) are always saved for retry.
+RETRY_FAILED_CALLS: bool = _env_bool("RETRY_FAILED_CALLS", False)
+# A lead is saved for retry (Gemini failure, failed call) at most this many times.
+RETRY_MAX_ATTEMPTS: int = max(0, _env_int("RETRY_MAX_ATTEMPTS", 3))
+# At start-up, look up the final result of calls that were still going when an
+# earlier run stopped (only rows updated within this many days; 0 = off).
+RECOVER_CALLS_DAYS: int = max(0, _env_int("RECOVER_CALLS_DAYS", 7))
 # After a call ends, wait up to this long for Dograh to fill in the outcome.
 RESULT_WAIT_SECONDS: int = _env_int("RESULT_WAIT_SECONDS", 20)
 # Extra wait beyond the retry delay for a scheduled retry call to appear.
@@ -126,12 +203,20 @@ DECISION_CONCURRENCY: int = _env_int("DECISION_CONCURRENCY", 8)
 RESULTS_MAX_LEAD_COLUMNS: int = _env_int("RESULTS_MAX_LEAD_COLUMNS", 80)
 
 # Results spreadsheet (created if missing, appended to if it exists).
-RESULTS_FILE: Path = Path(_env("RESULTS_FILE", str(PROJECT_DIR / "output" / "call_results.xlsx")))
+RESULTS_FILE: Path = _env_path("RESULTS_FILE", PROJECT_DIR / "output" / "call_results.xlsx")
+# The results files are rewritten at most this often while a run goes on
+# (and always when it ends), instead of after every single result.
+RESULTS_SAVE_SECONDS: float = max(0.0, _env_float("RESULTS_SAVE_SECONDS", 15))
 
 # Per-lead Excel pipeline tracker (one row per lead, updated at each stage).
-PIPELINE_TRACKER_FILE: Path = Path(_env("PIPELINE_TRACKER_FILE", str(PROJECT_DIR / "output" / "pipeline_tracker.xlsx")))
+PIPELINE_TRACKER_FILE: Path = _env_path("PIPELINE_TRACKER_FILE", PROJECT_DIR / "output" / "pipeline_tracker.xlsx")
 TRACKER_SAVE_SECONDS: int = _env_int("TRACKER_SAVE_SECONDS", 3)
 TRACKER_WARN_ROWS: int = _env_int("TRACKER_WARN_ROWS", 20000)
+# Finished tracker rows older than this many days are moved to
+# <tracker>_archive.xlsx when a run starts, so the live tracker (rewritten every
+# few seconds and read by the dashboard) stays small. Their numbers stay blocked
+# for SKIP_ALREADY_CALLED. 0 = never archive.
+TRACKER_ARCHIVE_DAYS: int = max(0, _env_int("TRACKER_ARCHIVE_DAYS", 30))
 
 # ------------------------------------------------------------------------------
 # Dashboard (read-only)
@@ -142,7 +227,7 @@ DASHBOARD_REFRESH_SECONDS: int = _env_int("DASHBOARD_REFRESH_SECONDS", 5)
 
 # Separate spreadsheet with only the businesses whose call the agent transferred
 # (to a person / another number), with their details - for whoever takes them over.
-TRANSFERS_FILE: Path = Path(_env("TRANSFERS_FILE", str(PROJECT_DIR / "output" / "transferred_calls.xlsx")))
+TRANSFERS_FILE: Path = _env_path("TRANSFERS_FILE", PROJECT_DIR / "output" / "transferred_calls.xlsx")
 # Call dispositions / tags that mean "transferred". Dograh records "transfer_call"
 # (phone transfer) or "call_transferred" (PBX transfer); a transfer tool can be set
 # to record its own disposition - add that here (comma-separated). Any disposition
@@ -163,4 +248,4 @@ LEAD_SOURCE_TOKEN: str = _env("LEAD_SOURCE_TOKEN", "", "STREAM_TOKEN")
 LEAD_SOURCE_TIMEOUT: int = max(120, _env_int("LEAD_SOURCE_TIMEOUT", 180))
 # Every received batch is saved here first, so a crash or Ctrl+C never loses
 # leads (the streamer marks them as sent the moment it hands them out).
-PULLED_BATCHES_DIR: Path = Path(_env("PULLED_BATCHES_DIR", str(PROJECT_DIR / "output" / "pulled_batches")))
+PULLED_BATCHES_DIR: Path = _env_path("PULLED_BATCHES_DIR", PROJECT_DIR / "output" / "pulled_batches")

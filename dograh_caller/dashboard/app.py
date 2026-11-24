@@ -58,6 +58,8 @@ def _default_media() -> Optional[Any]:
 class RunnerStartRequest(BaseModel):
     batch_size: int = Field(default=300, ge=1, le=1000)
     num_batches: int = Field(default=1, ge=1, le=100)
+    # Call again (in a later batch) leads whose call reached nobody; None = RETRY_FAILED_CALLS
+    retry_failed_calls: Optional[bool] = None
 
 
 def create_app(
@@ -78,15 +80,19 @@ def create_app(
     media_source = media if media is not None else _default_media()
     hosts = frozenset(h.lower() for h in allowed_hosts) if allowed_hosts else None
 
-    store = TrackerDataStore(
-        resolved_tracker,
-        services_file=services_file,
-        threshold=threshold,
-        refresh_seconds=refresh_seconds,
-        start_watcher=start_watcher,
-        demo=demo,
-    )
-    batch_runner = runner if runner is not None else BatchRunner(store=store, demo=demo)
+    if runner is not None and getattr(runner, "_store", None) is not None:
+        store = runner._store
+        batch_runner = runner
+    else:
+        store = TrackerDataStore(
+            resolved_tracker,
+            services_file=services_file,
+            threshold=threshold,
+            refresh_seconds=refresh_seconds,
+            start_watcher=start_watcher,
+            demo=demo,
+        )
+        batch_runner = BatchRunner(store=store, demo=demo)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -113,13 +119,30 @@ def create_app(
             response.headers["Cache-Control"] = "no-store"
         return response
 
+    def _active_runner_batch() -> Optional[dict[str, Any]]:
+        status = batch_runner.get_status()
+        if status.get("active") and status.get("batch_id"):
+            return status
+        return None
+
     @app.get("/api/health")
     def api_health() -> JSONResponse:
         return JSONResponse(store.get_health())
 
+    @app.get("/api/batches")
+    def api_batches() -> JSONResponse:
+        active = _active_runner_batch()
+        batches = store.list_batches(active_batch=active)
+        return JSONResponse({
+            "batches": batches,
+            "active_batch_id": active["batch_id"] if active else None,
+            "latest_batch_id": batches[0]["batch_id"] if batches else None,
+        })
+
     @app.get("/api/summary")
-    def api_summary() -> JSONResponse:
-        summary = store.get_summary()
+    def api_summary(batch_id: Optional[str] = Query(None)) -> JSONResponse:
+        active = _active_runner_batch()
+        summary = store.get_summary(batch_id=batch_id, active_batch=active)
         summary["runner"] = batch_runner.get_status()
         return JSONResponse(summary)
 
@@ -131,7 +154,11 @@ def create_app(
     def api_runner_start(payload: Optional[RunnerStartRequest] = None) -> JSONResponse:
         req = payload or RunnerStartRequest()
         try:
-            status = batch_runner.start(batch_size=req.batch_size, num_batches=req.num_batches)
+            if req.retry_failed_calls is None:
+                status = batch_runner.start(batch_size=req.batch_size, num_batches=req.num_batches)
+            else:
+                status = batch_runner.start(batch_size=req.batch_size, num_batches=req.num_batches,
+                                            retry_failed_calls=req.retry_failed_calls)
         except RunnerBusyError as e:
             raise HTTPException(status_code=409, detail=str(e)) from e
         except ValueError as e:
@@ -152,9 +179,11 @@ def create_app(
         order: str = Query("asc"),
         page: int = Query(1, ge=1),
         page_size: int = Query(50, ge=1, le=200),
+        batch_id: Optional[str] = Query(None),
     ) -> JSONResponse:
         if view not in _VALID_VIEWS:
             raise HTTPException(status_code=400, detail=f"Unknown view: {view}")
+        active = _active_runner_batch()
         data = store.get_leads(
             view=view,
             service=service,
@@ -164,6 +193,8 @@ def create_app(
             order=order,
             page=page,
             page_size=page_size,
+            batch_id=batch_id,
+            active_batch_id=str(active["batch_id"]) if active else None,
         )
         return JSONResponse(data)
 

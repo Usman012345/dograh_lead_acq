@@ -45,7 +45,9 @@ DOGRAH_API_KEY=your-dograh-key
 DOGRAH_BASE_URL=https://dograh.grobots.ai/api/v1
 ```
 
-A `.env` file in the parent folder is also checked if present.
+A `.env` in the parent folder is read **only if this folder has none** (the two
+are never mixed). Relative paths in `.env` (e.g. `RESULTS_FILE=output/x.xlsx`)
+are relative to this folder, wherever you start the program from.
 Keys belong only in `.env`, never in code.
 
 **c. Publish your agents in Dograh.** Calls always use an agent's *published*
@@ -115,6 +117,7 @@ STREAMER_CHECK_SECONDS = 60
 ```bash
 python main.py                           # live: calls only the configured file/list (does not auto-pull)
 python main.py leads.xlsx --score-only   # test scoring only; never calls Dograh
+python main.py leads.xlsx --retry-failed-calls   # also keep leads nobody answered, to call them again
 ```
 
 By default `USE_STREAMER = False`, so starting `main.py` never pulls or calls
@@ -160,10 +163,13 @@ Calls take about a minute each and happen one at a time, so a big list takes hou
 
 ## 4. Stopping it
 
-Press **Ctrl+C**. The program pauses this run's campaigns in Dograh, so no new
-calls are made, and saves the results so far.
+- **In the dashboard:** click **Stop** in the top bar. Active Dograh campaigns are paused, then the program takes one last look at their calls: a call Dograh started at that moment is recorded (so that number is never dialed twice) and calls that already ended get their real result. Unfinished leads are marked `interrupted`; the `.pending.json` batch stays saved and the next **Start Batch** continues it with **only the leads that were not finished** (no lead is scored or called twice).
+- **In the terminal (`pull_leads.py` / `main.py`):** press **Ctrl+C** (or stop the process with `kill` / `systemctl stop`, which act the same). The program pauses this run's campaigns in Dograh, so no new calls are made, and saves the results so far. Leads that failed Gemini scoring or whose call should be tried again are kept: in a streamer batch they are resumed with it, and `main.py` writes them to its retry files.
 
-Don't just close the window: then the campaigns stay running in Dograh and you
+Calls that were still going when a run stopped get their final result
+automatically the next time a run starts (`RECOVER_CALLS_DAYS`).
+
+Don't just close the terminal window: then campaigns stay running in Dograh and you
 have to pause them there yourself.
 
 ---
@@ -196,16 +202,24 @@ lead had. The file appears with the first transfer. In `call_results.xlsx` those
 
 | `status` | Meaning |
 |---|---|
-| `called` | The call happened; see `call_disposition` |
+| `called` | Someone was reached (or the call was transferred); see `call_disposition` |
 | `not_interested` | Gemini scored it below 80% for every service; not called |
 | `scored_qualified` | Scored ≥ 80% in a `--score-only` run; not called |
 | `decision_error` | Gemini request failed after retries; saved for retry |
 | `dropped_...` | Phone problem: `not_us`, `invalid_number`, `special_number` (e.g. 900), `fax_only` (only fax numbers — fax numbers are never called), `duplicate`, `already_called`, `no_phone` |
-| `call_failed` / `call_timeout` | Dograh couldn't place the call, or it never finished |
+| `call_failed` | The call reached nobody (`call_disposition` busy, no-answer, failed, voicemail), or it could not be placed at all (`detail` says why) |
+| `call_timeout` | The call was placed but its result never arrived |
 | `skipped_missing_data` | The agent's script needs information this business didn't have |
 | `interrupted` | Run stopped (`Stop` or `Ctrl+C`) before the lead finished |
 
-> **Keep `output/call_results.xlsx` and `output/pipeline_tracker.xlsx`.** Together they track who was already called so earlier businesses are not called again.
+**Retries.** Leads that could not be dialed at all (campaign could not start, …)
+are always saved to be called again in a later batch. Leads whose call
+**reached nobody** are saved too when you choose **Retry failed calls** (the
+checkbox in the dashboard's Start dialog, `--retry-failed-calls`, or
+`RETRY_FAILED_CALLS=true`). A lead is retried at most `RETRY_MAX_ATTEMPTS`
+(3) times. A number that reached nobody is never counted as "already called".
+
+> **Keep `output/call_results.xlsx`, `output/pipeline_tracker.xlsx` and `output/pipeline_tracker_archive.xlsx` (with its `.pipeline_tracker_archive_index.json`).** Together they track who was already called so earlier businesses are not called again. Finished tracker rows older than `TRACKER_ARCHIVE_DAYS` (30) move to the archive so the live tracker and dashboard stay fast; archived batches no longer appear in the dashboard's Batches list.
 
 ---
 
@@ -242,7 +256,12 @@ python pull_leads.py         # stays idle until you press Enter before each ping
 If it is stopped mid-batch (Ctrl+C, Stop button, crash, error), the batch stays in
 `output/pulled_batches/*.pending.json` and is finished first on the next start,
 before any new leads are taken. That matters because the streamer marks leads as
-sent the moment it hands them out. Numbers that were already called are skipped.
+sent the moment it hands them out. A `*.progress.json` next to it records which
+leads were already finished, so only the rest are processed. In the dashboard a
+saved batch is worked through in pieces of the **Leads per batch** you choose
+(the Start dialog shows how many saved leads come first). Retry batches a run
+creates (Gemini failures, failed calls) are picked up by the **next** Start, not
+the run that created them.
 
 ## 7. Sending leads from other code
 
@@ -270,7 +289,8 @@ python dashboard_server.py   # optional: --host 127.0.0.1 --port 8090 --tracker 
 Then open <http://127.0.0.1:8090>.
 
 - **What it reads:** `output/pipeline_tracker.xlsx` (read-only snapshots; never locks the workbook). Leads appear as they progress through each stage, and the server serves the pre-built `dashboard/static/` bundle without needing Node at runtime.
-- **Start / Stop Batch:** starts **idle** on startup (`source_url` from `LEAD_SOURCE_URL` is shown in the **Start Lead Batch Run** dialog). Click **Start Batch** to pull 1–100 batches of 1–1,000 leads directly from the reverse proxy and run the pipeline in the background (or click **Stop** to pause Dograh campaigns and keep unfinished leads pending for resume). In `--demo` mode, **Start Batch** runs an offline simulation without touching the streamer or Dograh.
+- **Start / Stop Batch:** starts **idle** on startup (`source_url` from `LEAD_SOURCE_URL` is shown in the **Start Lead Batch Run** dialog). Click **Start Batch** to pull 1–100 batches of 1–1,000 leads directly from the reverse proxy and run the pipeline in the background (or click **Stop** to pause Dograh campaigns and keep unfinished leads pending for resume). The dialog has a **Retry failed calls** option and warns when saved leads from an earlier run will be processed first. Starting a new batch immediately clears the dashboard to show **only that job's leads**. In `--demo` mode, **Start Batch** runs an offline simulation without touching the streamer or Dograh.
+- **Batch History dropdown:** use the **Batches** dropdown in the top bar to switch between the live/latest batch, any previous batch, `"Earlier runs"` (pre-`batch_id` rows), or `"All Batches"` combined history; a banner with a one-click button lets you jump back to the latest/live batch. Cross-batch `SKIP_ALREADY_CALLED` protection still blocks re-calling numbers already called in earlier batches.
 - **Recordings and transcripts:** the server fetches them from Dograh with the key in `.env`. The key and the private file links never reach the browser.
 - **Security:** the dashboard has **no login**. By default it binds to `127.0.0.1:8090` (this computer only) and refuses requests for other host names. With a non-loopback `--host` it prints a warning, because anyone who can reach the address can see lead details, phone numbers, transcripts, recordings, and batch controls.
 
@@ -291,8 +311,11 @@ python dashboard_server.py --demo
 | Add or change a service (who it targets, which agent calls) | Edit [services.yaml](services.yaml); no code. See [SERVICES.md](SERVICES.md) |
 | Test scoring without placing any calls | `python main.py path\to\leads.xlsx --score-only` |
 | Call fewer, surer leads (or more) | Set `INTEREST_THRESHOLD=0.9` (stricter) or `0.75` in `.env` |
-| Change the batch size | Set `LEAD_BATCH_SIZE=500` in `.env` (and `BATCH_SIZE` in the streamer's `.env` to match) |
-| Change retries for busy / no-answer calls | `CAMPAIGN_MAX_RETRIES`, `CAMPAIGN_RETRY_DELAY_SECONDS` in `.env` |
+| Change the batch size | In the dashboard **Start Batch** dialog pick 1–1,000 leads × 1–100 batches per job; for CLI defaults, set `LEAD_BATCH_SIZE=500` in `.env` (and `BATCH_SIZE` in the streamer's `.env` to match) |
+| View previous batches in the dashboard | Use the top-bar **Batches** dropdown (`Batch #1`, …, `Earlier runs`, or `All Batches`) |
+| Change retries for busy / no-answer calls | `CAMPAIGN_MAX_RETRIES`, `CAMPAIGN_RETRY_DELAY_SECONDS` in `.env` (Dograh's quick retries within a campaign) |
+| Call leads nobody answered again in a later batch | Tick **Retry failed calls** in the Start dialog, pass `--retry-failed-calls`, or set `RETRY_FAILED_CALLS=true` |
+| Send more lead fields to the agent | Use them as `{{variables}}` in the agent (sent automatically), or list them in `DOGRAH_EXTRA_FIELDS` |
 | Run a different file once without editing main.py | `python main.py other.xlsx --limit 5` |
 
 All settings: [DOCUMENTATION.md](DOCUMENTATION.md), section 4.

@@ -1,7 +1,10 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import "./leads-acquisition.css";
+
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import { BatchHistoryDropdown } from "./components/BatchHistoryDropdown";
 import { BatchRunnerModal } from "./components/BatchRunnerModal";
 import { CloseIcon, PhoneForwardIcon, PlayIcon, StopIcon } from "./components/Icons";
 import { LeadDetailModal } from "./components/LeadDetailModal";
@@ -10,12 +13,25 @@ import { TransferredPanel } from "./components/TransferredPanel";
 import { ViewModal } from "./components/ViewModal";
 import { apiPath } from "./lib/api";
 import { formatClock, minutesSince, plural } from "./lib/format";
-import { DEMO_LEAD_DETAIL, DEMO_SUMMARY, DEMO_TRANSFERRED_ROWS } from "./mockData";
-import { OpenLeadRequest, OpenViewRequest, RunnerStatus, SummaryResponse, TransferredRow } from "./types";
+import { DEMO_SUMMARY, DEMO_TRANSFERRED_ROWS } from "./mockData";
+import { BatchInfo, OpenLeadRequest, OpenViewRequest, RunnerStatus, SummaryResponse, TransferredRow } from "./types";
 
 const QUIET_AFTER_MINUTES = 30;
 
-function headline(summary: SummaryResponse | null): React.ReactNode {
+function headline(
+  summary: SummaryResponse | null,
+  runner: RunnerStatus | null,
+  selectedBatch: BatchInfo | null,
+  effectiveBatchId: string | null,
+): React.ReactNode {
+  if (runner?.active && (!summary || summary.nodes.incoming.total === 0) && (!effectiveBatchId || effectiveBatchId === runner.batch_id)) {
+    return (
+      <>
+        <h2>Starting new batch</h2>
+        <p>Pulling leads from the reverse proxy — only this job&apos;s leads will appear here.</p>
+      </>
+    );
+  }
   if (!summary || !summary.tracker_found || summary.nodes.incoming.total === 0) {
     return (
       <>
@@ -27,11 +43,18 @@ function headline(summary: SummaryResponse | null): React.ReactNode {
   const { incoming, qualified, call_results, transferred } = summary.nodes;
   const inProgress =
     summary.activity.verifying + summary.activity.deciding + summary.activity.queued + summary.activity.calling;
+  const scopeLabel =
+    effectiveBatchId === "all"
+      ? "across all batches"
+      : selectedBatch
+        ? `in ${selectedBatch.label}`
+        : "";
   return (
     <>
       <h2>
         <em>{plural(transferred.total, "conversation")}</em> handed to your team from{" "}
         <em>{plural(incoming.total, "lead")}</em>
+        {scopeLabel ? ` ${scopeLabel}` : ""}
       </h2>
       <p>
         {qualified.total.toLocaleString()} qualified · {plural(call_results.called, "call")} completed
@@ -44,6 +67,7 @@ function headline(summary: SummaryResponse | null): React.ReactNode {
 export default function LeadsAcquisitionPage() {
   const [summary, setSummary] = useState<SummaryResponse | null>(null);
   const [runner, setRunner] = useState<RunnerStatus | null>(null);
+  const [selectedBatchId, setSelectedBatchId] = useState<string | null>(null);
   const [apiUnreachable, setApiUnreachable] = useState(false);
   const [demoFallback, setDemoFallback] = useState(false);
   const [transferredRows, setTransferredRows] = useState<TransferredRow[]>([]);
@@ -54,14 +78,20 @@ export default function LeadsAcquisitionPage() {
   const [stopping, setStopping] = useState(false);
   const [dismissedRunKey, setDismissedRunKey] = useState<string | null>(null);
   const runnerSeqRef = useRef(0);
+  const selectedBatchRef = useRef<string | null>(null);
+  selectedBatchRef.current = selectedBatchId;
 
-  const fetchSummary = useCallback(async () => {
+  const fetchSummary = useCallback(async (batchOverride?: string | null) => {
     const seqBefore = runnerSeqRef.current;
+    const targetBatch = batchOverride !== undefined ? batchOverride : selectedBatchRef.current;
+    const qs = targetBatch ? `?batch_id=${encodeURIComponent(targetBatch)}` : "";
     try {
-      const resp = await fetch(apiPath("/summary"));
+      const resp = await fetch(apiPath(`/summary${qs}`));
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const json = (await resp.json()) as SummaryResponse;
-      setSummary(json);
+      if (targetBatch === selectedBatchRef.current) {
+        setSummary(json);
+      }
       if (json.runner && runnerSeqRef.current === seqBefore) {
         setRunner(json.runner);
       }
@@ -81,9 +111,10 @@ export default function LeadsAcquisitionPage() {
     }
   }, []);
 
-  const fetchTransferred = useCallback(async () => {
+  const fetchTransferred = useCallback(async (batchId?: string | null) => {
+    const qs = batchId ? `&batch_id=${encodeURIComponent(batchId)}` : "";
     try {
-      const resp = await fetch(apiPath("/leads?view=transferred&page_size=200&sort=lead_id&order=desc"));
+      const resp = await fetch(apiPath(`/leads?view=transferred&page_size=200&sort=lead_id&order=desc${qs}`));
       if (!resp.ok) return;
       const json = await resp.json();
       setTransferredRows(Array.isArray(json.rows) ? json.rows : []);
@@ -92,15 +123,29 @@ export default function LeadsAcquisitionPage() {
     }
   }, []);
 
+  const batches = useMemo(() => summary?.batches ?? [], [summary?.batches]);
+  const effectiveBatchId = selectedBatchId ?? summary?.selected_batch_id ?? null;
+  const selectedBatch = useMemo(
+    () => (effectiveBatchId && effectiveBatchId !== "all" ? batches.find((b) => b.batch_id === effectiveBatchId) ?? null : null),
+    [batches, effectiveBatchId],
+  );
+  const latestBatch = batches[0] ?? null;
+  const viewingHistory = Boolean(
+    (effectiveBatchId === "all" && batches.length > 1) ||
+      (selectedBatch && latestBatch && selectedBatch.batch_id !== latestBatch.batch_id),
+  );
+
   useEffect(() => {
     fetchSummary();
   }, [fetchSummary]);
 
+  const trackerFound = summary?.tracker_found;
+  const dataAsOf = summary?.data_as_of;
   useEffect(() => {
-    if (summary?.tracker_found && !demoFallback) fetchTransferred();
+    if (trackerFound && !demoFallback) fetchTransferred(effectiveBatchId);
     else if (demoFallback) setTransferredRows(DEMO_TRANSFERRED_ROWS);
-    else if (summary) setTransferredRows([]);
-  }, [summary?.data_as_of, summary?.tracker_found, demoFallback, fetchTransferred]);
+    else if (trackerFound !== undefined) setTransferredRows([]);
+  }, [dataAsOf, trackerFound, demoFallback, effectiveBatchId, fetchTransferred]);
 
   useEffect(() => {
     const interval = runner?.active ? 1500 : Math.max(2000, (summary?.refresh_seconds ?? 5) * 1000);
@@ -116,7 +161,27 @@ export default function LeadsAcquisitionPage() {
       setRunner(nextStatus);
       setDismissedRunKey(null);
       setBatchModalOpen(false);
-      fetchSummary();
+      setActiveView(null);
+      setActiveLead(null);
+      if (nextStatus.batch_id) {
+        selectedBatchRef.current = nextStatus.batch_id;
+        setSelectedBatchId(nextStatus.batch_id);
+        setTransferredRows([]);
+        fetchSummary(nextStatus.batch_id);
+      } else {
+        fetchSummary();
+      }
+    },
+    [fetchSummary],
+  );
+
+  const handleSelectBatch = useCallback(
+    (batchId: string) => {
+      selectedBatchRef.current = batchId;
+      setSelectedBatchId(batchId);
+      setActiveView(null);
+      setActiveLead(null);
+      fetchSummary(batchId);
     },
     [fetchSummary],
   );
@@ -195,6 +260,11 @@ export default function LeadsAcquisitionPage() {
               <span className="status-light" aria-hidden="true" />
               {status.text}
             </span>
+            <BatchHistoryDropdown
+              batches={batches}
+              selectedBatchId={effectiveBatchId}
+              onSelect={handleSelectBatch}
+            />
             {runner?.active ? (
               <div className="runner-top-controls">
                 <span className="runner-mini-progress">
@@ -306,7 +376,28 @@ export default function LeadsAcquisitionPage() {
                 </div>
               </section>
             )}
-            <div className="headline">{headline(summary)}</div>
+            {viewingHistory && latestBatch && (
+              <div className="history-banner" role="status">
+                <span>
+                  Viewing{" "}
+                  <strong>
+                    {effectiveBatchId === "all" ? "All Batches" : selectedBatch?.label ?? "previous batch"}
+                  </strong>
+                  .{" "}
+                  {runner?.active
+                    ? "A new batch is currently running."
+                    : "Switch back to see the latest batch."}
+                </span>
+                <button
+                  type="button"
+                  className="history-banner-btn"
+                  onClick={() => handleSelectBatch(latestBatch.batch_id)}
+                >
+                  {runner?.active ? "View Live Batch" : "Switch to Latest"}
+                </button>
+              </div>
+            )}
+            <div className="headline">{headline(summary, runner, selectedBatch, effectiveBatchId)}</div>
             <PipelineFlow summary={summary} onOpen={openView} />
           </main>
 
@@ -327,6 +418,8 @@ export default function LeadsAcquisitionPage() {
             defaultNumBatches={runner?.total_batches || 1}
             sourceUrl={runner?.source_url ?? null}
             demo={Boolean(summary?.demo || demoFallback)}
+            defaultRetryFailedCalls={Boolean(runner?.retry_failed_calls)}
+            pendingLeads={runner?.pending_leads ?? 0}
             onClose={() => setBatchModalOpen(false)}
             onStarted={handleRunnerStarted}
           />
@@ -334,8 +427,9 @@ export default function LeadsAcquisitionPage() {
 
         {activeView && summary && (
           <ViewModal
-            key={`${activeView.view}:${activeView.filter ?? ""}`}
+            key={`${effectiveBatchId ?? "latest"}:${activeView.view}:${activeView.filter ?? ""}`}
             view={activeView.view}
+            batchId={effectiveBatchId}
             initialFilter={activeView.filter}
             summary={summary}
             isDetailOpen={activeLead !== null}

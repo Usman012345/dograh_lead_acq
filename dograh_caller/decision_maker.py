@@ -210,7 +210,26 @@ def _state_text(value: Any) -> str:
     return cell_text(value)
 
 
-def _is_noise_value(value: Any) -> bool:
+# Field-name words for amounts and counts: a long number there is a figure, not a phone number
+_FIGURE_WORDS = frozenset({
+    "revenue", "revenues", "sales", "turnover", "income", "amount", "amounts", "value", "valuation",
+    "budget", "price", "cost", "costs", "contract", "contracts", "award", "bond", "bonding", "capacity",
+    "size", "employees", "employee", "staff", "headcount", "volume", "funding", "capital", "assets",
+    "sqft", "square", "feet", "acres", "population", "total", "count", "number",
+})
+# "$1,250,000,000", "1,250,000", "1.2 billion", "USD 12,500,000.50"
+_FIGURE_VALUE = re.compile(
+    r"^\s*(?:[$€£¥]|usd|eur|gbp)?\s*\d{1,3}(?:,\d{3})+(?:\.\d+)?\s*(?:[kmb]|million|billion|usd)?\s*$"
+    r"|^\s*(?:[$€£¥]|usd|eur|gbp)\s*[\d.,]+\s*(?:[kmb]|million|billion)?\s*$",
+    re.IGNORECASE,
+)
+# Thousands grouping anywhere ("10,000,000 - 25,000,000"); phone numbers are never written like that
+_GROUPED_FIGURE = re.compile(r"(?<![\d,])\d{1,3}(?:,\d{3}){2,}(?![\d,])")
+# Characters a phone number (or a list of them) is written with
+_PHONE_CHARS = re.compile(r"^[\d\s+().\-/,;|:#xXextEXT]+$")
+
+
+def _is_noise_value(value: Any, path: tuple = ()) -> bool:
     if isinstance(value, bool):
         return False
     if is_placeholder(value):
@@ -219,7 +238,16 @@ def _is_noise_value(value: Any) -> bool:
     if not text or _URL_VALUE.match(text) or _EMAIL_VALUE.match(text) or _DATE_VALUE.match(text):
         return True
     digits = sum(c.isdigit() for c in text)
-    return digits >= 10 and digits / len(text) >= 0.6      # looks like a phone/fax number
+    if digits < 10 or digits / len(text) < 0.6:
+        return False
+    # A money amount or a grouped figure ("$1,250,000,000") is business information
+    if _FIGURE_VALUE.match(text) or _GROUPED_FIGURE.search(text):
+        return False
+    # A long plain number in a revenue / size / count field is a figure too
+    path_words = {w for part in path for w in key_words(part)}
+    if path_words & _FIGURE_WORDS and re.fullmatch(r"\s*[\d.,]+\s*", text):
+        return False
+    return bool(_PHONE_CHARS.match(text))      # looks like a phone/fax number
 
 
 def lead_state(lead: Dict[str, Any]) -> Dict[str, Any]:
@@ -237,7 +265,7 @@ def lead_state(lead: Dict[str, Any]) -> Dict[str, Any]:
     items = []  # (priority, order, key, text)
     merged: Dict[str, int] = {}
     for order, (path, value) in enumerate(walk_scalars(lead)):
-        if not path or _is_noise_field(path) or _is_noise_value(value):
+        if not path or _is_noise_field(path) or _is_noise_value(value, path):
             continue
         text = _state_text(value)
         if len(text) > config.LEAD_MAX_FIELD_CHARS:

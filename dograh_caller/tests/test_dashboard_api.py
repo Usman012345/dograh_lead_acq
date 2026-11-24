@@ -237,3 +237,99 @@ def test_static_bundle_serves_index_assets_and_blocks_traversal(client):
     # Path traversal out of dashboard/static must never succeed
     assert client.get("/..%2F.env").status_code == 404
     assert client.get("/assets/../../.env").status_code == 404
+
+
+def test_batches_listing_and_batch_id_scoping(tmp_path):
+    from decision_maker import Decision, Service, ServiceScore
+    from dograh_client import Agent, CallOutcome
+    from number_verifier import NumberVerifier
+    from pipeline_tracker import PipelineTracker
+
+    path = tmp_path / "tracker.xlsx"
+    verifier = NumberVerifier()
+    svc = Service(id="paradise", name="Paradise Estimating", agent_id=3, description="Est", good_fit="", not_a_fit="")
+
+    t = PipelineTracker(path)
+    t.open()
+    try:
+        # Legacy row (no batch_id)
+        l_leg = t.register({"company": "Fictional Legacy Co", "phone": "(512) 555-0150"}, "python")
+        t.record_verification(l_leg, verifier.verify({"phone": "(512) 555-0150"}))
+        t.record_finished(l_leg, "not_interested")
+
+        # Job 1: 2 leads (1 qualified+called, 1 non-qualified)
+        l_j1_a = t.register({"company": "Fictional Job1 Alpha", "phone": "(512) 555-0151"}, "streamer", batch_id="job_1")
+        l_j1_b = t.register({"company": "Fictional Job1 Beta", "phone": "(512) 555-0152"}, "streamer", batch_id="job_1")
+        t._by_lead_id[l_j1_a]["received_at"] = "2026-11-24T10:00:00"
+        t._by_lead_id[l_j1_b]["received_at"] = "2026-11-24T10:00:05"
+        t.record_verification(l_j1_a, verifier.verify({"phone": "(512) 555-0151"}))
+        t.record_verification(l_j1_b, verifier.verify({"phone": "(512) 555-0152"}))
+        t.record_decision(
+            l_j1_a,
+            Decision(
+                probabilities={"paradise": 0.9},
+                service=svc,
+                probability=0.9,
+                scores=[ServiceScore("paradise", "Paradise Estimating", 0.9, "Good fit.")],
+                best_service=svc,
+                summary="Fits estimating.",
+                verdict="Qualified",
+                threshold=0.8,
+                model="gemini-3.8-flash",
+            ),
+        )
+        t.record_campaign(l_j1_a, Agent(3, "Olivia", "published"), 20, "Paradise_1")
+        t.record_call_started(l_j1_a, 701, 1)
+        t.record_finished(l_j1_a, "called", "", CallOutcome(status="called", run_id=701, disposition="user_qualified", attempts=1))
+        t.record_finished(l_j1_b, "not_interested")
+
+        # Job 2 (newer): 1 lead
+        l_j2 = t.register({"company": "Fictional Job2 Gamma", "phone": "(512) 555-0153"}, "streamer", batch_id="job_2")
+        t._by_lead_id[l_j2]["received_at"] = "2026-11-24T11:00:00"
+        t.record_verification(l_j2, verifier.verify({"phone": "(512) 555-0153"}))
+        t.record_finished(l_j2, "not_interested")
+        t.save()
+    finally:
+        t.close()
+
+    with TestClient(create_app(tracker_path=path, start_watcher=False)) as c:
+        batches_resp = c.get("/api/batches").json()
+        assert [b["batch_id"] for b in batches_resp["batches"]] == ["job_2", "job_1", "__legacy__"]
+        assert [b["label"] for b in batches_resp["batches"]] == ["Batch #2", "Batch #1", "Earlier runs"]
+        assert batches_resp["latest_batch_id"] == "job_2"
+
+        # Default /api/summary and /api/leads return ONLY the latest batch (job_2, 1 lead)
+        s_default = c.get("/api/summary").json()
+        assert s_default["selected_batch_id"] == "job_2"
+        assert s_default["nodes"]["incoming"]["total"] == 1
+        assert s_default["nodes"]["non_qualified"]["total"] == 1
+        assert s_default["nodes"]["call_results"]["called"] == 0
+
+        inc_default = c.get("/api/leads?view=incoming").json()
+        assert inc_default["batch_id"] == "job_2"
+        assert inc_default["total"] == 1
+        assert [r["lead_id"] for r in inc_default["rows"]] == [l_j2]
+
+        # Selecting previous batch (job_1) loads ONLY job_1's 2 leads
+        s_j1 = c.get("/api/summary?batch_id=job_1").json()
+        assert s_j1["selected_batch_id"] == "job_1"
+        assert s_j1["nodes"]["incoming"]["total"] == 2
+        assert s_j1["nodes"]["call_results"]["called"] == 1
+
+        inc_j1 = c.get("/api/leads?view=incoming&batch_id=job_1").json()
+        assert inc_j1["total"] == 2
+        assert {r["lead_id"] for r in inc_j1["rows"]} == {l_j1_a, l_j1_b}
+
+        # Selecting legacy batch loads ONLY legacy row
+        s_leg = c.get("/api/summary?batch_id=__legacy__").json()
+        assert s_leg["nodes"]["incoming"]["total"] == 1
+
+        # Selecting "all" loads combined 4 leads across history
+        s_all = c.get("/api/summary?batch_id=all").json()
+        assert s_all["selected_batch_id"] == "all"
+        assert s_all["nodes"]["incoming"]["total"] == 4
+        assert c.get("/api/leads?view=incoming&batch_id=all").json()["total"] == 4
+
+        # Lead detail works regardless of which batch the lead belongs to
+        assert c.get(f"/api/leads/{l_j1_a}").status_code == 200
+        assert c.get(f"/api/leads/{l_j2}").status_code == 200

@@ -1,6 +1,7 @@
 import React, { useLayoutEffect, useMemo, useRef, useState } from "react";
-import { OpenViewRequest, SummaryResponse, ViewName } from "../types";
+
 import { percent, serviceColor } from "../lib/format";
+import { OpenViewRequest, SummaryResponse, ViewName } from "../types";
 import { AnimatedNumber } from "./AnimatedNumber";
 import { AttentionCard } from "./AttentionCard";
 import { FunnelCard } from "./FunnelCard";
@@ -68,7 +69,7 @@ export const PipelineFlow: React.FC<Props> = ({ summary, onOpen }) => {
   const thresholdPct = Math.round((summary?.threshold ?? 0.8) * 100);
   const n = summary?.nodes;
   const activity = summary?.activity;
-  const services = summary?.services ?? [];
+  const services = useMemo(() => summary?.services ?? [], [summary?.services]);
   const reducedMotion =
     typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 

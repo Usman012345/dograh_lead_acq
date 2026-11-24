@@ -102,8 +102,9 @@ curl -s https://ai-sdr.grobots.ai/health
 # Progress stats (token required)
 curl -s -H "Authorization: Bearer $STREAM_TOKEN" https://ai-sdr.grobots.ai/stats
 
-# Pull next batch of up to 300 leads
+# Pull next batch of up to 300 leads (or request 1..1000 via ?limit=)
 curl -s -H "Authorization: Bearer $STREAM_TOKEN" https://ai-sdr.grobots.ai/leads/next
+curl -s -H "Authorization: Bearer $STREAM_TOKEN" "https://ai-sdr.grobots.ai/leads/next?limit=50"
 ```
 
 ## 5. Verify & Operations

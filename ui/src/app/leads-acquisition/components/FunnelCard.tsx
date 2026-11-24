@@ -1,6 +1,7 @@
 import React from "react";
-import { OpenViewRequest, SummaryResponse, ViewName } from "../types";
+
 import { percent } from "../lib/format";
+import { OpenViewRequest, SummaryResponse, ViewName } from "../types";
 
 interface Step {
   label: string;

@@ -22,32 +22,45 @@ Usage from other code (e.g. the AI-powered scraper):
             await pipeline.submit(lead)
     # leaving the block creates the campaigns and waits for all calls
 
-Queues live in memory only: if the process stops, leads still in flight are lost.
+Queues live in memory only: if the process stops, leads still in flight are lost
+(streamer batches stay on disk and are resumed; see pull_leads.BatchStore).
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import Any, AsyncIterable, Dict, Iterable, List, Optional, Union
+from typing import Any, AsyncIterable, Callable, Dict, Iterable, List, Optional, Union
 
 import config
 from campaign_manager import CampaignJob, CampaignLead
 from decision_maker import Decision, DecisionMaker, Service, load_services
-from dograh_client import Agent, CallOutcome, DograhClient, is_transferred
+from dograh_client import Agent, CallOutcome, DograhClient, is_not_reached, is_transferred, outcome_from_run
 from number_verifier import NumberVerifier, Verification, load_called_numbers
 from pipeline_tracker import PipelineTracker
 from results_store import TRANSFER_COLUMNS, TRANSFERS_SHEET_NAME, ResultsStore, transfer_row
 
 _STOP_TIMEOUT = 5
+# Bookkeeping this program stores inside a lead saved for retry: {"retries": {"decision": 1, "call": 2}}.
+# It is removed again when the lead is submitted, so Gemini, Dograh and the sheets never see it.
+LEAD_META_KEY = "_dograh_caller"
+_MAX_RECOVER_CAMPAIGNS = 50
 
 
 def log(stage: str, message: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {stage:<8} {message}", flush=True)
+
+
+def _never_dialed(outcome: Optional[CallOutcome]) -> bool:
+    """call_failed before any call was placed (campaign not created/started, or never dialed)."""
+    if outcome is None:
+        return True
+    return outcome.run_id is None and str(outcome.error or "").startswith("Not dialed")
 
 
 class _Item:
@@ -58,15 +71,19 @@ class _Item:
         "campaign_name",
         "decision",
         "detail",
+        "dialed",
         "lead",
         "lead_id",
         "outcome",
+        "position",
+        "retries",
         "service",
         "status",
         "verification",
     )
 
-    def __init__(self, lead: Dict[str, Any]):
+    def __init__(self, lead: Dict[str, Any], position: Optional[int] = None,
+                 retries: Optional[Dict[str, int]] = None):
         self.lead = lead
         self.lead_id: str = ""
         self.verification: Optional[Verification] = None
@@ -78,6 +95,9 @@ class _Item:
         self.campaign_name: Optional[str] = None
         self.status = ""
         self.detail = ""
+        self.dialed = False                       # Dograh started at least one call for it
+        self.position = position                  # index in the submitted sequence (run_leads)
+        self.retries: Dict[str, int] = dict(retries or {})
 
     @property
     def label(self) -> str:
@@ -98,10 +118,19 @@ class LeadPipeline:
         score_only: bool = False,
         tracker_file: Optional[Union[str, Path]] = None,
         source_label: str = "python",
+        batch_id: Optional[str] = None,
         stop_event: Optional[Any] = None,
+        retry_failed_calls: Optional[bool] = None,
+        on_lead_final: Optional[Callable[[int, str], None]] = None,
     ):
         self.score_only = bool(score_only)
         self.stop_event = stop_event
+        # Re-queue leads whose call reached nobody (busy, no answer, failed, ...)
+        self.retry_failed_calls = config.RETRY_FAILED_CALLS if retry_failed_calls is None else bool(retry_failed_calls)
+        # Called with (position, status) when a submitted lead is finished for good
+        # (not when it was interrupted or saved for a retry)
+        self.on_lead_final = on_lead_final
+        self.batch_id = str(batch_id or "").strip()
         if results_file:
             self.results_file = Path(results_file)
         elif self.score_only:
@@ -121,7 +150,11 @@ class LeadPipeline:
         self.threshold = config.INTEREST_THRESHOLD if threshold is None else threshold
         self.services_file = Path(services_file) if services_file else config.SERVICES_FILE
         self.stats: Counter = Counter()
-        self.failed_decision_leads: List[Dict[str, Any]] = []
+        self.failed_decision_leads: List[Dict[str, Any]] = []   # Gemini failed: score again later
+        self.retry_call_leads: List[Dict[str, Any]] = []        # call failed: call again later
+        self.store: Optional[ResultsStore] = None
+        self.decider: Optional[DecisionMaker] = None
+        self._warned_monitor = False
 
         self._verify_q: asyncio.Queue = asyncio.Queue(maxsize=config.QUEUE_MAXSIZE)
         self._decision_q: asyncio.Queue = asyncio.Queue(maxsize=config.QUEUE_MAXSIZE)
@@ -135,6 +168,7 @@ class LeadPipeline:
         self._tracker_task: Optional[asyncio.Task] = None
         self._started = False
         self._warned_tracker = False
+        self._results_dirty = False
         self.dograh: Optional[DograhClient] = None
         self.transfers: Optional[ResultsStore] = None
         self.agents: Dict[str, Agent] = {}
@@ -157,14 +191,6 @@ class LeadPipeline:
         await asyncio.to_thread(self.tracker.open)
         try:
             self.services = load_services(self.services_file)
-            if self.score_only:
-                already_called = set()
-            elif config.SKIP_ALREADY_CALLED:
-                already_called = await asyncio.to_thread(load_called_numbers, self.results_file)
-                already_called |= self.tracker.called_numbers()
-            else:
-                already_called = set()
-            self.verifier = NumberVerifier(already_called=already_called)
             self.decider = DecisionMaker(self.services, self.threshold, config.GEMINI_API_KEY, config.GEMINI_MODEL)
             self.store = await asyncio.to_thread(ResultsStore, self.results_file)
             # Only businesses whose call was transferred; the file is created on the first transfer
@@ -176,6 +202,26 @@ class LeadPipeline:
             )
             self.dograh = None if self.score_only else DograhClient()
             self.agents = {}
+
+            # Calls still going when an earlier run stopped: fetch their final result
+            # first, so the already-called list below is complete.
+            if not self.score_only:
+                recovered = await asyncio.to_thread(self._recover_unfinished_calls)
+                if recovered:
+                    log("setup", f"Recovered the final result of {recovered} call(s) from earlier runs")
+
+            if self.score_only or not config.SKIP_ALREADY_CALLED:
+                already_called = set()
+            else:
+                # The main results file always counts, also when this run writes elsewhere (--output)
+                result_files = [self.results_file]
+                if self.results_file.resolve() != config.RESULTS_FILE.resolve():
+                    result_files.append(config.RESULTS_FILE)
+                already_called = set()
+                for path in result_files:
+                    already_called |= await asyncio.to_thread(load_called_numbers, path)
+                already_called |= self.tracker.called_numbers()
+            self.verifier = NumberVerifier(already_called=already_called)
             # Campaign names use the date the run started ("Draftliner_<start date>")
             self.run_started = datetime.now()
 
@@ -211,10 +257,121 @@ class LeadPipeline:
                 self.tracker.close()
             except Exception:
                 pass
+            if self.dograh is not None:
+                try:
+                    self.dograh.close()
+                except Exception:
+                    pass
+            if self.decider is not None:
+                try:
+                    await self.decider.close()
+                except Exception:
+                    pass
             raise
 
     def _should_stop(self) -> bool:
         return bool(self.stop_event is not None and self.stop_event.is_set())
+
+    def _stop_reason(self) -> str:
+        return "Stopped from dashboard" if self._should_stop() else "Run stopped before completion"
+
+    # ------------------------------------------------------------------ recovery
+
+    def _recover_unfinished_calls(self) -> int:
+        """
+        Tracker rows of earlier runs whose call was still going (or not yet seen)
+        when that run stopped: look the call up in its Dograh campaign. A finished
+        call gets its real result (tracker + a new results row); a call still
+        going gets its run id recorded, so the number is never dialed twice.
+        Best effort: errors are logged and ignored. Blocking (run in a thread).
+        """
+        if self.dograh is None or config.RECOVER_CALLS_DAYS <= 0:
+            return 0
+        get_runs = getattr(self.dograh, "get_campaign_runs", None)
+        if not callable(get_runs):
+            return 0
+        try:
+            rows = self.tracker.unfinished_call_rows(config.RECOVER_CALLS_DAYS)
+        except Exception as e:
+            log("setup", f"WARNING: could not look for unfinished calls ({e})")
+            return 0
+        by_campaign: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            by_campaign.setdefault(str(row.get("campaign_id")), []).append(row)
+
+        recovered = 0
+        for cid, campaign_rows in list(by_campaign.items())[:_MAX_RECOVER_CAMPAIGNS]:
+            try:
+                runs = get_runs(int(float(cid)))
+            except Exception as e:
+                log("setup", f"WARNING: could not check campaign {cid} for unfinished calls ({e})")
+                continue
+            attempts: Dict[str, List[Dict[str, Any]]] = {}
+            for run in sorted(runs or [], key=lambda r: r.get("id") or 0):
+                ref = str((run.get("initial_context") or {}).get("lead_ref") or "")
+                if ref:
+                    attempts.setdefault(ref, []).append(run)
+            for row in campaign_rows:
+                lead_id = str(row.get("lead_id") or "")
+                tries = attempts.get(lead_id)
+                if not tries:
+                    continue
+                last = tries[-1]
+                if not last.get("is_completed"):
+                    self.tracker.record_run_seen(lead_id, last.get("id"), len(tries))
+                    continue
+                outcome = outcome_from_run(last, attempts=len(tries))
+                detail = "Result recovered after the run had stopped"
+                self.tracker.record_finished(lead_id, outcome.status, outcome.error or detail, outcome)
+                try:
+                    self._append_result(self._recovered_row(row, outcome, outcome.error or detail),
+                                        self._lead_from_json(row.get("lead_json")))
+                except Exception as e:
+                    log("results", f"ERROR writing recovered result for {lead_id}: {e}")
+                recovered += 1
+        return recovered
+
+    @staticmethod
+    def _lead_from_json(text: Any) -> Dict[str, Any]:
+        try:
+            lead = json.loads(str(text or ""))
+        except ValueError:
+            return {}
+        return lead if isinstance(lead, dict) else {}
+
+    @staticmethod
+    def _recovered_row(trow: Dict[str, Any], o: CallOutcome, detail: str) -> Dict[str, Any]:
+        def val(key: str) -> Any:
+            v = trow.get(key)
+            return None if v in (None, "") else v
+
+        return {
+            "processed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "pipeline_lead_id": val("lead_id"),
+            "status": o.status,
+            "detail": detail,
+            "phone_raw": val("phone_raw"),
+            "phone_e164": val("phone_e164"),
+            "phone_location": val("phone_location"),
+            "phone_timezone": val("phone_timezone"),
+            "interested_service": val("assigned_service"),
+            "interest_probability": val("best_probability"),
+            "decision_verdict": val("decision_verdict"),
+            "decision_summary": val("decision_summary"),
+            "agent_id": val("agent_id"),
+            "agent_name": val("agent_name"),
+            "campaign_id": val("campaign_id"),
+            "campaign_name": val("campaign_name"),
+            "dograh_run_id": o.run_id,
+            "call_attempts": o.attempts or None,
+            "call_disposition": o.disposition,
+            "call_duration_s": o.duration_seconds,
+            "call_tags": ", ".join(map(str, o.tags)) if o.tags else None,
+            "transcript_url": o.transcript_url,
+            "recording_url": o.recording_url,
+            "dograh_response": o.raw or None,
+            "call_transferred": True if is_transferred(o.raw) else None,
+        }
 
     async def _await_or_stop(self, awaitable: Any) -> bool:
         """Await `awaitable`, returning True if finished or False if stop_event fired."""
@@ -246,6 +403,7 @@ class LeadPipeline:
     def _append_result(self, row: Dict[str, Any], lead: Optional[Dict[str, Any]]) -> None:
         if self.store is not None:
             self.store.append(row, lead)
+            self._results_dirty = True
         if self.transfers is not None and row.get("call_transferred"):
             t_row, rest = transfer_row(row, lead or {})
             self.transfers.append(t_row, rest)
@@ -281,8 +439,11 @@ class LeadPipeline:
                 finally:
                     q.task_done()
 
-    async def submit(self, lead: Dict[str, Any]) -> None:
-        """Hand one lead (a dict) to the pipeline. Waits if the pipeline is full."""
+    async def submit(self, lead: Dict[str, Any], position: Optional[int] = None) -> None:
+        """
+        Hand one lead (a dict) to the pipeline. Waits if the pipeline is full.
+        `position` (optional) is handed back to on_lead_final when the lead is done.
+        """
         if not self._started:
             await self.start()
         if not isinstance(lead, dict):
@@ -290,8 +451,18 @@ class LeadPipeline:
         if self._should_stop():
             return
         self.stats["received"] += 1
-        item = _Item(dict(lead))
-        item.lead_id = self._track(self.tracker.register, item.lead, self.source_label) or ""
+        lead = dict(lead)
+        meta = lead.pop(LEAD_META_KEY, None)
+        retries = meta.get("retries") if isinstance(meta, dict) else None
+        clean_retries = {}
+        if isinstance(retries, dict):
+            for kind, n in retries.items():
+                try:
+                    clean_retries[str(kind)] = int(n)
+                except (TypeError, ValueError):
+                    pass
+        item = _Item(lead, position=position, retries=clean_retries)
+        item.lead_id = self._track(self.tracker.register, item.lead, self.source_label, self.batch_id) or ""
         if not await self._await_or_stop(self._verify_q.put(item)):
             self._finish_nowait(item, "interrupted", "Stopped from dashboard")
 
@@ -340,7 +511,8 @@ class LeadPipeline:
                     await asyncio.gather(*self._stage_tasks, return_exceptions=True)
                 self._stage_tasks.clear()
 
-                if abort and (stopped_by_event or self._pending):
+                if abort:
+                    # Leads still queued or waiting for a campaign never finished: say so in the results
                     self._interrupt_queued_items(
                         "Stopped from dashboard" if stopped_by_event else "Run stopped before completion"
                     )
@@ -380,7 +552,8 @@ class LeadPipeline:
                         self.tracker.close()
                     except Exception:
                         pass
-                await self.decider.close()
+                if self.decider is not None:
+                    await self.decider.close()
                 if self.dograh is not None:
                     self.dograh.close()
                 self._started = False
@@ -420,8 +593,9 @@ class LeadPipeline:
                     log("verify", f"DROP {raw} ({item.verification.reason}) - {item.label}")
                     await self._finish(item, item.verification.reason)
             except asyncio.CancelledError:
-                if self._should_stop() and not item.status:
-                    self._finish_nowait(item, "interrupted", "Stopped from dashboard")
+                # Cancelled while working on this lead (Stop, Ctrl+C, error): record it
+                if not item.status:
+                    self._finish_nowait(item, "interrupted", self._stop_reason())
                 raise
             except Exception as e:  # never let one bad lead kill the stage
                 await self._finish(item, "error", f"verifier: {e}")
@@ -450,12 +624,11 @@ class LeadPipeline:
                 self._pending.setdefault(item.service.id, []).append(item)
                 log("decide", f"QUALIFIED {phone} {item.label} -> {item.service.name} ({probs})")
             except asyncio.CancelledError:
-                if self._should_stop() and not item.status:
-                    self._finish_nowait(item, "interrupted", "Stopped from dashboard")
+                if not item.status and item not in self._pending.get(getattr(item.service, "id", ""), []):
+                    self._finish_nowait(item, "interrupted", self._stop_reason())
                 raise
             except Exception as e:
                 log("decide", f"ERROR {item.label}: {e}")
-                self.failed_decision_leads.append(dict(item.lead))
                 self._track(self.tracker.record_decision_error, item.lead_id, str(e))
                 await self._finish(item, "decision_error", str(e))
             finally:
@@ -482,13 +655,16 @@ class LeadPipeline:
                 # The fallback prefix can never collide with a tracker ID (L000001, ...)
                 ref = item.lead_id or f"untracked-{service.id}-{idx}"
                 leads.append(CampaignLead(ref=ref, phone=item.verification.e164,
-                                          lead=item.lead, payload=item))
+                                          lead=item.lead, payload=item,
+                                          time_zone=item.verification.time_zone or ""))
             job = CampaignJob(service, self.agents[service.id], leads, name_date=self.run_started)
             try:
                 await asyncio.to_thread(job.launch, self.dograh)
                 error = None
             except Exception as e:
                 error = e
+            for note in job.warnings:
+                log("campaign", f"NOTE '{job.name}': {note}")
             if job.campaign_id is not None:
                 # Track it even if starting failed, so it is never left running on exit
                 self._live_campaigns[job.campaign_id] = job.name
@@ -526,6 +702,7 @@ class LeadPipeline:
 
         def on_started(cl: CampaignLead, run: Dict[str, Any], attempt: int) -> None:
             item: _Item = cl.payload
+            item.dialed = True
             self._track(self.tracker.record_call_started, item.lead_id, run.get("id"), attempt)
             retry = f" (retry #{attempt - 1})" if attempt > 1 else ""
             log("call", f"-> Calling {cl.phone}{retry} ({item.label}) [{item.campaign_name}, run {run.get('id')}]")
@@ -544,25 +721,46 @@ class LeadPipeline:
                 log("call", f"<- {cl.phone} {outcome.status.upper()}: {outcome.error}")
             self._finish_nowait(item, outcome.status, outcome.error or "")
 
+        def interrupt_unfinished(job: CampaignJob, reason: str) -> None:
+            for cl in job.leads:
+                if cl.ref not in finished_refs and not cl.payload.status:
+                    self._finish_nowait(cl.payload, "interrupted", reason)
+
+        async def pause(job: CampaignJob, what: str) -> None:
+            try:
+                state = await asyncio.to_thread(self.dograh.stop_campaign, job.campaign_id)
+                self._live_campaigns.pop(job.campaign_id, None)
+                log("campaign", f"'{job.name}' (campaign {job.campaign_id}) {what} ({state})")
+            except Exception as e:
+                log("campaign", f"'{job.name}' (campaign {job.campaign_id}) {what} - "
+                                f"could not pause it now, will retry on exit: {e}")
+
         async def follow(job: CampaignJob) -> None:
-            await job.monitor(
-                self.dograh,
-                on_started,
-                on_result,
-                progress_clock=progress_clock,
-                stop_event=self.stop_event,
-            )
+            try:
+                await job.monitor(
+                    self.dograh,
+                    on_started,
+                    on_result,
+                    progress_clock=progress_clock,
+                    stop_event=self.stop_event,
+                )
+            except Exception as e:
+                # One campaign's monitor failing must not leave the others unwatched
+                log("campaign", f"ERROR following '{job.name}' (campaign {job.campaign_id}): {e}")
+                await pause(job, "monitoring failed - paused")
+                interrupt_unfinished(job, f"Monitoring the campaign failed: {e}")
+                return
             if self._should_stop():
+                await pause(job, "stopped")
+                # Last look after the pause: a call Dograh started at that moment is
+                # recorded (never dialed again), and calls that already ended get their result.
                 try:
-                    state = await asyncio.to_thread(self.dograh.stop_campaign, job.campaign_id)
-                    self._live_campaigns.pop(job.campaign_id, None)
-                    log("campaign", f"'{job.name}' (campaign {job.campaign_id}) stopped ({state})")
+                    if config.STOP_SYNC_SECONDS > 0:
+                        await asyncio.sleep(config.STOP_SYNC_SECONDS)
+                    await job.final_sync(self.dograh, on_started, on_result)
                 except Exception as e:
-                    log("campaign", f"'{job.name}' (campaign {job.campaign_id}) stopped - "
-                                    f"could not pause it now, will retry on exit: {e}")
-                for cl in job.leads:
-                    if cl.ref not in finished_refs and not cl.payload.status:
-                        self._finish_nowait(cl.payload, "interrupted", "Stopped from dashboard")
+                    log("campaign", f"'{job.name}': could not check its last calls after the stop ({e})")
+                interrupt_unfinished(job, "Stopped from dashboard")
                 return
             # Every lead has its final result: make sure Dograh isn't left "running"
             try:
@@ -574,14 +772,34 @@ class LeadPipeline:
                 log("campaign", f"'{job.name}' (campaign {job.campaign_id}) finished - "
                                 f"could not pause it now, will retry on exit: {e}")
 
-        await asyncio.gather(*(follow(job) for job in jobs))
+        results = await asyncio.gather(*(follow(job) for job in jobs), return_exceptions=True)
+        for job, res in zip(jobs, results):
+            if isinstance(res, BaseException) and not isinstance(res, asyncio.CancelledError):
+                log("campaign", f"ERROR in '{job.name}': {res}")
+                interrupt_unfinished(job, f"Monitoring the campaign failed: {res}")
+        if any(isinstance(r, asyncio.CancelledError) for r in results):
+            raise asyncio.CancelledError()
 
     async def _writer_worker(self) -> None:
+        """
+        Adds result rows as they arrive and rewrites the results files at most
+        every RESULTS_SAVE_SECONDS (each save rewrites the whole workbook, so not
+        after every single row). close() always does a final save.
+        """
         warned_locked = False
         warned_transfers_locked = False
+        interval = float(config.RESULTS_SAVE_SECONDS)
+        last_save = time.monotonic()
         while True:
-            first = await self._results_q.get()
-            batch = [first]
+            batch: List[Any] = []
+            if self._results_dirty:
+                wait = max(0.05, interval - (time.monotonic() - last_save))
+                try:
+                    batch.append(await asyncio.wait_for(self._results_q.get(), timeout=wait))
+                except asyncio.TimeoutError:
+                    pass
+            else:
+                batch.append(await self._results_q.get())
             while True:
                 try:
                     batch.append(self._results_q.get_nowait())
@@ -589,28 +807,40 @@ class LeadPipeline:
                     break
             try:
                 for row, lead in batch:
-                    self._append_result(row, lead)
-                if self._results_q.empty():  # batch saves while rows keep arriving
-                    if self.transfers is not None:
-                        if not await asyncio.to_thread(self._save_store_locked, self.transfers):
-                            if not warned_transfers_locked:
-                                log("results", f"WARNING: {self.transfers.path.name} is open in another program; "
-                                               "will keep retrying - close it to let transfers save")
-                                warned_transfers_locked = True
-                        else:
-                            warned_transfers_locked = False
-                    if not await asyncio.to_thread(self._save_store_locked, self.store):
-                        if not warned_locked:
-                            log("results", f"WARNING: {self.store.path.name} is open in another program; "
-                                           "will keep retrying - close it to let results save")
-                            warned_locked = True
-                    else:
-                        warned_locked = False
-            except Exception as e:
-                log("results", f"ERROR writing row: {e}")
+                    try:
+                        self._append_result(row, lead)
+                    except Exception as e:
+                        log("results", f"ERROR writing row: {e}")
             finally:
                 for _ in batch:
                     self._results_q.task_done()
+            if not self._results_dirty or time.monotonic() - last_save < interval:
+                continue
+            try:
+                ok = True
+                if self.transfers is not None:
+                    if not await asyncio.to_thread(self._save_store_locked, self.transfers):
+                        ok = False
+                        if not warned_transfers_locked:
+                            log("results", f"WARNING: {self.transfers.path.name} is open in another program; "
+                                           "will keep retrying - close it to let transfers save")
+                            warned_transfers_locked = True
+                    else:
+                        warned_transfers_locked = False
+                if not await asyncio.to_thread(self._save_store_locked, self.store):
+                    ok = False
+                    if not warned_locked:
+                        log("results", f"WARNING: {self.store.path.name} is open in another program; "
+                                       "will keep retrying - close it to let results save")
+                        warned_locked = True
+                else:
+                    warned_locked = False
+                last_save = time.monotonic()
+                if ok:
+                    self._results_dirty = False
+            except Exception as e:
+                last_save = time.monotonic()
+                log("results", f"ERROR saving results: {e}")
 
     async def _tracker_worker(self) -> None:
         while True:
@@ -634,6 +864,47 @@ class LeadPipeline:
             self.verifier.mark_called(item.verification.e164)
         self._track(self.tracker.record_finished, item.lead_id, status, detail, item.outcome)
         self._results_q.put_nowait((self._row(item), item.lead))
+        saved = self._save_for_retry(item, status)
+        if (self.on_lead_final is not None and item.position is not None
+                and status != "interrupted" and not saved):
+            try:
+                self.on_lead_final(item.position, status)
+            except Exception as e:
+                log("batch", f"WARNING: could not record batch progress ({e})")
+
+    def _save_for_retry(self, item: _Item, status: str) -> bool:
+        """
+        Keep a lead to be processed again later:
+          decision_error                         -> scored again (failed_decision_leads)
+          call_failed, never dialed              -> called again (retry_call_leads), always
+          call_failed, dialed but reached nobody -> called again, only with retry_failed_calls
+        Each kind is retried at most RETRY_MAX_ATTEMPTS times. Returns True if saved.
+        """
+        if self.score_only and status != "decision_error":
+            return False
+        if status == "decision_error":
+            kind, target = "decision", self.failed_decision_leads
+        elif status == "call_failed":
+            o = item.outcome
+            if not item.dialed and _never_dialed(o):
+                pass
+            elif (self.retry_failed_calls and o is not None and o.run_id is not None
+                  and is_not_reached(o.disposition)):
+                pass
+            else:
+                return False
+            kind, target = "call", self.retry_call_leads
+        else:
+            return False
+        attempt = int(item.retries.get(kind, 0)) + 1
+        if attempt > config.RETRY_MAX_ATTEMPTS:
+            self.stats[f"retry_given_up_{kind}"] += 1
+            log("retry", f"NOT saved again: {item.label} - {status} after {attempt - 1} retr"
+                         f"{'y' if attempt == 2 else 'ies'} (RETRY_MAX_ATTEMPTS={config.RETRY_MAX_ATTEMPTS})")
+            return False
+        target.append({**item.lead, LEAD_META_KEY: {"retries": {**item.retries, kind: attempt}}})
+        self.stats[f"retry_saved_{kind}"] += 1
+        return True
 
     async def _finish(self, item: _Item, status: str, detail: str = "") -> None:
         self._finish_nowait(item, status, detail)
@@ -712,7 +983,16 @@ class LeadPipeline:
                   f"call failed/timeout: {s['call_failed'] + s['call_timeout']} | "
                   f"skipped (missing data): {s['skipped_missing_data']} | "
                   f"errors: {s['decision_error'] + s['error']}")
-        print(f"Results: {self.store.path}", flush=True)
+        saved_d, saved_c = s["retry_saved_decision"], s["retry_saved_call"]
+        if saved_d or saved_c:
+            print(f"Saved for a later retry: {saved_d} lead(s) to score again, {saved_c} lead(s) to call again",
+                  flush=True)
+        given_up = s["retry_given_up_decision"] + s["retry_given_up_call"]
+        if given_up:
+            print(f"Not retried again (RETRY_MAX_ATTEMPTS={config.RETRY_MAX_ATTEMPTS} reached): {given_up} lead(s)",
+                  flush=True)
+        if self.store is not None:
+            print(f"Results: {self.store.path}", flush=True)
         if self.transfers is not None and s["transferred"]:
             print(f"Transferred calls: {s['transferred']} -> {self.transfers.path}", flush=True)
 
@@ -722,12 +1002,18 @@ async def run_leads(
     batch_size: Optional[int] = None,
     failed_leads: Optional[List[Dict[str, Any]]] = None,
     stop_event: Optional[Any] = None,
+    retry_leads: Optional[List[Dict[str, Any]]] = None,
     **pipeline_kwargs: Any,
 ) -> Counter:
     """
     Run leads (list, generator or async generator of dicts) through the pipeline
     in batches of `batch_size` (default LEAD_BATCH_SIZE = 300): each batch is
     verified, scored, put into campaigns and fully called before the next one.
+
+    failed_leads receives the leads Gemini could not score, retry_leads the
+    leads whose call should be tried again - also when the run ends with an
+    error or Ctrl+C. pipeline_kwargs go to LeadPipeline (e.g. on_lead_final,
+    which is called with the lead's position in `leads`).
     """
     size = max(1, batch_size or config.LEAD_BATCH_SIZE)
     total = len(leads) if hasattr(leads, "__len__") else None  # type: ignore[arg-type]
@@ -746,7 +1032,7 @@ async def run_leads(
                 last = count + size if total is None else min(count + size, total)
                 log("batch", f"Batch {count // size + 1}: leads {count + 1}-{last}"
                              + (f" of {total}" if total is not None else ""))
-            await pipeline.submit(lead)
+            await pipeline.submit(lead, position=count)
             count += 1
             if pipeline._should_stop():
                 aborted = True
@@ -770,17 +1056,24 @@ async def run_leads(
         aborted = True
         raise
     finally:
-        await pipeline.close(abort=(aborted or pipeline._should_stop()))
-    if failed_leads is not None:
-        failed_leads.extend(pipeline.failed_decision_leads)
+        try:
+            await pipeline.close(abort=(aborted or pipeline._should_stop()))
+        finally:
+            # Handed back even when the run ended with an error or Ctrl+C
+            if failed_leads is not None:
+                failed_leads.extend(pipeline.failed_decision_leads)
+            if retry_leads is not None:
+                retry_leads.extend(pipeline.retry_call_leads)
     return pipeline.stats
 
 
 def run_leads_sync(leads: Iterable[Dict[str, Any]], batch_size: Optional[int] = None,
                    failed_leads: Optional[List[Dict[str, Any]]] = None,
                    stop_event: Optional[Any] = None,
+                   retry_leads: Optional[List[Dict[str, Any]]] = None,
                    **pipeline_kwargs: Any) -> Counter:
     """Blocking version of run_leads() for plain (non-async) scripts."""
     return asyncio.run(
-        run_leads(leads, batch_size=batch_size, failed_leads=failed_leads, stop_event=stop_event, **pipeline_kwargs)
+        run_leads(leads, batch_size=batch_size, failed_leads=failed_leads, stop_event=stop_event,
+                  retry_leads=retry_leads, **pipeline_kwargs)
     )

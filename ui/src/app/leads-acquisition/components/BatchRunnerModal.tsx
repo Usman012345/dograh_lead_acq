@@ -1,6 +1,7 @@
 import React, { useMemo, useRef, useState } from "react";
-import { RunnerStatus } from "../types";
+
 import { apiPath } from "../lib/api";
+import { RunnerStatus } from "../types";
 import { AlertIcon, CloseIcon, LayersIcon, PlayIcon } from "./Icons";
 import { useFocusTrap } from "./useFocusTrap";
 
@@ -12,6 +13,8 @@ interface Props {
   defaultNumBatches?: number;
   sourceUrl?: string | null;
   demo?: boolean;
+  defaultRetryFailedCalls?: boolean;
+  pendingLeads?: number;
   onClose: () => void;
   onStarted: (status: RunnerStatus) => void;
 }
@@ -45,12 +48,15 @@ export const BatchRunnerModal: React.FC<Props> = ({
   defaultNumBatches = 1,
   sourceUrl = null,
   demo = false,
+  defaultRetryFailedCalls = false,
+  pendingLeads = 0,
   onClose,
   onStarted,
 }) => {
   const panelRef = useRef<HTMLDivElement>(null);
   const [batchSizeInput, setBatchSizeInput] = useState(String(defaultBatchSize));
   const [numBatchesInput, setNumBatchesInput] = useState(String(defaultNumBatches));
+  const [retryFailedCalls, setRetryFailedCalls] = useState(defaultRetryFailedCalls);
   const [submitting, setSubmitting] = useState(false);
   const [apiError, setApiError] = useState<string | null>(null);
 
@@ -89,6 +95,7 @@ export const BatchRunnerModal: React.FC<Props> = ({
         body: JSON.stringify({
           batch_size: parsedBatchSize,
           num_batches: parsedNumBatches,
+          retry_failed_calls: retryFailedCalls,
         }),
       });
       let payload: unknown = null;
@@ -254,6 +261,33 @@ export const BatchRunnerModal: React.FC<Props> = ({
               ))}
             </div>
           </div>
+
+          <label className="runner-check">
+            <input
+              type="checkbox"
+              checked={retryFailedCalls}
+              disabled={submitting}
+              onChange={(event) => setRetryFailedCalls(event.target.checked)}
+            />
+            <span>
+              <strong>Retry failed calls</strong>
+              <span className="runner-check-hint">
+                Leads whose call reached nobody (busy, no answer, failed, voicemail) are called again in a
+                later batch. Leads that could not be dialed at all are always retried.
+              </span>
+            </span>
+          </label>
+
+          {!demo && pendingLeads > 0 && (
+            <div className="runner-pending" role="note">
+              <AlertIcon size={16} />
+              <span>
+                {pendingLeads.toLocaleString()} saved {pendingLeads === 1 ? "lead" : "leads"} from an earlier run
+                will be processed first, {parsedBatchSize !== null ? parsedBatchSize.toLocaleString() : "your chosen number of"} per
+                batch, before any new leads are pulled.
+              </span>
+            </div>
+          )}
 
           <div className="runner-summary-card" aria-live="polite">
             <div className="runner-summary-main">

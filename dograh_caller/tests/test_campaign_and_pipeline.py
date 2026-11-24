@@ -38,6 +38,8 @@ def test_retry_pending_uses_completed_mono_and_safe_fallback(monkeypatch):
 def test_monitor_shared_progress_clock_and_undialed_vs_dialed_timeout(monkeypatch):
     monkeypatch.setattr(config, "CAMPAIGN_POLL_SECONDS", 0.01)
     monkeypatch.setattr(config, "CAMPAIGN_IDLE_TIMEOUT_SECONDS", 0.08)
+    # The never-ending call counts as stuck after this long (then the idle timeout applies)
+    monkeypatch.setattr(config, "CAMPAIGN_MAX_CALL_SECONDS", 0.05)
     monkeypatch.setattr(config, "RESULT_WAIT_SECONDS", 0.0)
 
     svc = Service(id="svc", name="Svc", agent_id=1, description="d", good_fit="", not_a_fit="")

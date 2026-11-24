@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import inspect
 import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import config
 from dashboard.data import TrackerDataStore
@@ -30,6 +31,10 @@ class RunnerBusyError(Exception):
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _new_batch_id() -> str:
+    return f"job_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
 
 
 def _call_ping(
@@ -60,6 +65,10 @@ def _call_process(
     stop_event: threading.Event,
     batches_dir: Optional[Path] = None,
     tracker_file: Optional[Path] = None,
+    batch_id: Optional[str] = None,
+    progress_path: Optional[Path] = None,
+    lead_indexes: Optional[List[int]] = None,
+    retry_failed_calls: Optional[bool] = None,
 ) -> Any:
     candidate_kwargs: Dict[str, Any] = {
         "threshold": None,
@@ -71,6 +80,13 @@ def _call_process(
         candidate_kwargs["batches_dir"] = batches_dir
     if tracker_file is not None:
         candidate_kwargs["tracker_file"] = tracker_file
+    if batch_id:
+        candidate_kwargs["batch_id"] = batch_id
+    if progress_path is not None:
+        candidate_kwargs["progress_path"] = progress_path
+        candidate_kwargs["lead_indexes"] = lead_indexes
+    if retry_failed_calls is not None:
+        candidate_kwargs["retry_failed_calls"] = retry_failed_calls
     try:
         sig = inspect.signature(process_fn)
         params = sig.parameters
@@ -124,6 +140,7 @@ class BatchRunner:
         self._status: Dict[str, Any] = {
             "state": "idle",
             "active": False,
+            "batch_id": None,
             "batch_size": 300,
             "total_batches": 1,
             "current_batch": 0,
@@ -135,7 +152,38 @@ class BatchRunner:
             "finished_at": None,
             "message": "",
             "error": None,
+            "retry_failed_calls": config.RETRY_FAILED_CALLS,
         }
+        # pending file -> ((mtime_ns, size), number of leads): avoids re-reading big files on every poll
+        self._pending_cache: Dict[Path, Tuple[Tuple[int, int], int]] = {}
+        self._pending_lock = threading.Lock()
+
+    def pending_summary(self) -> Dict[str, int]:
+        """Saved (pending) batches and how many of their leads are not finished yet."""
+        if self.demo and self._ping_fn is None and self._process_fn is None:
+            return {"pending_batches": 0, "pending_leads": 0}
+        store = BatchStore(self._resolved_batches_dir())
+        batches = leads_left = 0
+        with self._pending_lock:
+            live = set()
+            for path in store.unfinished():
+                try:
+                    st = path.stat()
+                    sig = (st.st_mtime_ns, st.st_size)
+                    cached = self._pending_cache.get(path)
+                    if cached is None or cached[0] != sig:
+                        cached = (sig, len(store.load(path)["leads"]))
+                        self._pending_cache[path] = cached
+                    left = max(0, cached[1] - len(store.load_progress(path)))
+                except (OSError, ValueError):
+                    continue
+                live.add(path)
+                if left:
+                    batches += 1
+                    leads_left += left
+            for gone in set(self._pending_cache) - live:
+                self._pending_cache.pop(gone, None)
+        return {"pending_batches": batches, "pending_leads": leads_left}
 
     def _resolved_source_url(self) -> str:
         return self._source_url if self._source_url is not None else config.LEAD_SOURCE_URL
@@ -156,13 +204,20 @@ class BatchRunner:
 
     def get_status(self) -> Dict[str, Any]:
         with self._lock:
-            return self._snapshot_locked()
+            snapshot = self._snapshot_locked()
+        snapshot.update(self.pending_summary())
+        return snapshot
 
-    def start(self, batch_size: int = 300, num_batches: int = 1) -> Dict[str, Any]:
+    def start(self, batch_size: int = 300, num_batches: int = 1,
+              retry_failed_calls: Optional[bool] = None) -> Dict[str, Any]:
         if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not (1 <= batch_size <= 1000):
             raise ValueError("batch_size must be an integer between 1 and 1000")
         if isinstance(num_batches, bool) or not isinstance(num_batches, int) or not (1 <= num_batches <= 100):
             raise ValueError("num_batches must be an integer between 1 and 100")
+        retry_calls = config.RETRY_FAILED_CALLS if retry_failed_calls is None else bool(retry_failed_calls)
+
+        is_demo_sim = self.demo and self._ping_fn is None and self._process_fn is None
+        batch_id: Optional[str] = None if is_demo_sim else _new_batch_id()
 
         with self._lock:
             if self._status["active"]:
@@ -172,6 +227,7 @@ class BatchRunner:
             self._status = {
                 "state": "running",
                 "active": True,
+                "batch_id": batch_id,
                 "batch_size": batch_size,
                 "total_batches": num_batches,
                 "current_batch": 0,
@@ -185,10 +241,11 @@ class BatchRunner:
                     f"Starting {num_batches} batch(es) of up to {batch_size} leads..."
                 ),
                 "error": None,
+                "retry_failed_calls": retry_calls,
             }
             thread = threading.Thread(
                 target=self._run_worker,
-                args=(batch_size, num_batches, stop_event),
+                args=(batch_size, num_batches, stop_event, batch_id, retry_calls),
                 daemon=True,
                 name="batch-runner",
             )
@@ -196,6 +253,7 @@ class BatchRunner:
             snapshot = self._snapshot_locked()
 
         thread.start()
+        snapshot.update(self.pending_summary())
         return snapshot
 
     def stop(self) -> Dict[str, Any]:
@@ -225,12 +283,19 @@ class BatchRunner:
             self._status["message"] = message
             self._status["error"] = error
 
-    def _run_worker(self, batch_size: int, num_batches: int, stop_event: threading.Event) -> None:
+    def _run_worker(
+        self,
+        batch_size: int,
+        num_batches: int,
+        stop_event: threading.Event,
+        batch_id: Optional[str],
+        retry_failed_calls: Optional[bool] = None,
+    ) -> None:
         try:
             if self.demo and self._ping_fn is None and self._process_fn is None:
                 self._run_demo(batch_size, num_batches, stop_event)
             else:
-                self._run_live(batch_size, num_batches, stop_event)
+                self._run_live(batch_size, num_batches, stop_event, batch_id, retry_failed_calls)
         except Exception as exc:
             self._finish("error", f"Batch run failed: {exc}", error=str(exc))
 
@@ -268,7 +333,14 @@ class BatchRunner:
             f"Demo completed {completed} batch(es) ({processed} leads).",
         )
 
-    def _run_live(self, batch_size: int, num_batches: int, stop_event: threading.Event) -> None:
+    def _run_live(
+        self,
+        batch_size: int,
+        num_batches: int,
+        stop_event: threading.Event,
+        batch_id: Optional[str] = None,
+        retry_failed_calls: Optional[bool] = None,
+    ) -> None:
         pf = self._preflight_fn
         if pf is None and self._ping_fn is None and self._process_fn is None:
             pf = preflight
@@ -304,7 +376,12 @@ class BatchRunner:
         processed = 0
         completed = 0
         decision_errors = 0
+        call_retries = 0
         unreadable_pending: set[Path] = set()
+        # Only batches saved BEFORE this job are resumed by it. Retry batches this job
+        # writes (Gemini failures, failed calls) wait for the next job, so a job never
+        # spends its batches re-running its own failures.
+        resumable = set(batch_store.unfinished())
 
         for b in range(1, num_batches + 1):
             if stop_event.is_set():
@@ -312,32 +389,40 @@ class BatchRunner:
                 return
 
             leads: list[dict[str, Any]] = []
+            indexes: List[int] = []
             pending_path: Optional[Path] = None
+            resumed_total = 0
             while True:
-                unfinished = [p for p in batch_store.unfinished() if p not in unreadable_pending]
+                unfinished = [p for p in batch_store.unfinished()
+                              if p in resumable and p not in unreadable_pending]
                 if not unfinished:
                     pending_path = None
                     break
                 candidate = unfinished[0]
                 try:
-                    doc = batch_store.load(candidate)
+                    doc, left = batch_store.remaining(candidate)
                 except (OSError, ValueError):
                     unreadable_pending.add(candidate)
                     continue
-                if not doc["leads"]:
+                if not left:
                     batch_store.mark_done(candidate)
                     continue
+                # A saved batch is processed in pieces of the size asked for (not all at once)
                 pending_path = candidate
-                leads = doc["leads"]
+                indexes = left[:batch_size]
+                leads = [doc["leads"][i] for i in indexes]
+                resumed_total = len(left)
                 break
 
             if pending_path is not None:
                 fetched += len(leads)
+                rest = resumed_total - len(leads)
                 self._update(
                     current_batch=b,
                     current_batch_leads=len(leads),
                     leads_fetched=fetched,
-                    message=f"Processing saved batch {pending_path.name} ({len(leads)} leads)...",
+                    message=(f"Processing {len(leads)} saved lead(s) from {pending_path.name}"
+                             + (f" ({rest} more saved after these)..." if rest else "...")),
                 )
             else:
                 self._update(
@@ -361,6 +446,7 @@ class BatchRunner:
                     return
 
                 leads = list(result.leads)
+                indexes = list(range(len(leads)))
                 pending_path = batch_store.save(result, source_url)
                 fetched += len(leads)
                 self._update(
@@ -382,24 +468,39 @@ class BatchRunner:
                 stop_event,
                 batches_dir=batches_dir,
                 tracker_file=custom_tracker,
+                batch_id=batch_id,
+                progress_path=pending_path,
+                lead_indexes=indexes,
+                retry_failed_calls=retry_failed_calls,
             )
             if isinstance(stats, dict):
-                decision_errors += int(stats.get("decision_error") or 0)
+                saved = stats.get("retry_saved_decision")
+                decision_errors += int((saved if saved is not None else stats.get("decision_error")) or 0)
+                call_retries += int(stats.get("retry_saved_call") or 0)
             self._store.refresh(force=True)
 
             if stop_event.is_set():
-                self._finish("stopped", "Stopped by user. Unfinished batch kept for resume.")
+                self._finish("stopped", "Stopped by user. Unfinished leads kept and resumed on the next start.")
                 return
 
-            batch_store.mark_done(pending_path)
+            batch_store.add_progress(pending_path, indexes)
+            try:
+                _doc, still_left = batch_store.remaining(pending_path)
+            except (OSError, ValueError):
+                still_left = []
+            if not still_left:
+                batch_store.mark_done(pending_path)
             completed += 1
             processed += len(leads)
             self._update(batches_completed=completed, leads_processed=processed)
 
         summary_msg = f"Completed {completed} batch(es) ({processed} leads processed)."
+        notes = []
         if decision_errors:
-            summary_msg = (
-                f"Completed {completed} batch(es) ({processed} leads processed; "
-                f"{decision_errors} failed Gemini scoring and saved for retry)."
-            )
+            notes.append(f"{decision_errors} failed Gemini scoring and saved for retry")
+        if call_retries:
+            notes.append(f"{call_retries} call(s) saved to be tried again")
+        if notes:
+            summary_msg = (f"Completed {completed} batch(es) ({processed} leads processed; "
+                           f"{'; '.join(notes)}).")
         self._finish("completed", summary_msg)

@@ -15,7 +15,7 @@ import os
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -40,6 +40,7 @@ BASE_COLUMNS: List[str] = [
     "source_key",
     "source_lead_id",
     "source_label",
+    "batch_id",
     "previous_lead_id",
     "times_processed",
     # Summary
@@ -282,6 +283,37 @@ def _safe_int(val: Any, default: int = 1) -> int:
         return default
 
 
+def _parse_dt(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.strptime(str(value or "").strip()[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def _row_blocks_number(row: Dict[str, Any]) -> bool:
+    """
+    True if this row's number must never be called again: the call was answered
+    (called), its result never arrived (call_timeout), or Dograh dialed it and
+    the outcome is unknown. A call that is known to have reached nobody (busy,
+    no answer, failed, voicemail - config.NOT_REACHED_DISPOSITIONS) does not block.
+    """
+    phone = str(row.get("phone_e164") or "").strip()
+    if not phone:
+        return False
+    call_status = str(row.get("call_status") or "").strip()
+    if call_status in ("called", "call_timeout"):
+        return True
+    run_id = row.get("dograh_run_id")
+    if run_id is None or str(run_id).strip() == "":
+        return False
+    disposition = str(row.get("call_disposition") or "").strip().lower()
+    if call_status == "call_failed" and disposition in config.NOT_REACHED_DISPOSITIONS:
+        return False
+    return True
+
+
 def _has_call_activity(row: Dict[str, Any]) -> bool:
     """True if this tracker row has ever been assigned to a campaign or dialed."""
     return bool(
@@ -333,6 +365,123 @@ def _release_os_lock(fh: Any) -> None:
             pass
 
 
+def _read_rows(path: Path) -> List[Dict[str, Any]]:
+    """Rows of a tracker-format workbook, with split lead_json / dograh_json chunks joined again."""
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        ws = wb[TRACKER_SHEET_NAME] if TRACKER_SHEET_NAME in wb.sheetnames else wb.active
+        rows_iter = ws.iter_rows(values_only=True)
+        header = [str(h).strip() if h is not None else "" for h in next(rows_iter, [])]
+        if not header or "lead_id" not in header:
+            raise ValueError("Missing 'lead_id' header in tracker workbook")
+        loaded: List[Dict[str, Any]] = []
+        for vals in rows_iter:
+            if not vals or all(v in (None, "") for v in vals):
+                continue
+            raw_row = {h: v for h, v in zip(header, vals) if h}
+            lead_chunks = []
+            dograh_chunks = []
+            row: Dict[str, Any] = {}
+            for k, v in raw_row.items():
+                if k == "lead_json" or re.fullmatch(r"lead_json_\d+", k):
+                    lead_chunks.append((1 if k == "lead_json" else int(k.rsplit("_", 1)[1]), str(v or "")))
+                elif k == "dograh_json" or re.fullmatch(r"dograh_json_\d+", k):
+                    dograh_chunks.append((1 if k == "dograh_json" else int(k.rsplit("_", 1)[1]), str(v or "")))
+                else:
+                    row[k] = "" if v is None else v
+            row["lead_json"] = "".join(c for _, c in sorted(lead_chunks))
+            row["dograh_json"] = "".join(c for _, c in sorted(dograh_chunks))
+            if not str(row.get("lead_id") or "").strip():
+                continue
+            loaded.append(row)
+        return loaded
+    finally:
+        wb.close()
+
+
+def _write_tmp_workbook(path: Path, rows: List[Dict[str, Any]]) -> Path:
+    """Write rows in tracker format to a temporary file next to `path`; returns the temp file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.stem}.{os.getpid()}.tmp{path.suffix}")
+
+    max_lead_chunks = 1
+    max_dograh_chunks = 1
+    split_rows: List[Tuple[Dict[str, Any], List[str], List[str]]] = []
+    for row in rows:
+        lc = _split_chunks(str(row.get("lead_json") or ""))
+        dc = _split_chunks(str(row.get("dograh_json") or ""))
+        max_lead_chunks = max(max_lead_chunks, len(lc))
+        max_dograh_chunks = max(max_dograh_chunks, len(dc))
+        split_rows.append((row, lc, dc))
+
+    columns = list(BASE_COLUMNS)
+    for i in range(2, max_lead_chunks + 1):
+        columns.append(f"lead_json_{i}")
+    for i in range(2, max_dograh_chunks + 1):
+        columns.append(f"dograh_json_{i}")
+
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet(title=TRACKER_SHEET_NAME)
+    ws.append(columns)
+
+    for row, lc, dc in split_rows:
+        values: List[Any] = []
+        for col in columns:
+            if col == "lead_json":
+                val: Any = lc[0]
+            elif col.startswith("lead_json_"):
+                idx = int(col.rsplit("_", 1)[1]) - 1
+                val = lc[idx] if idx < len(lc) else ""
+            elif col == "dograh_json":
+                val = dc[0]
+            elif col.startswith("dograh_json_"):
+                idx = int(col.rsplit("_", 1)[1]) - 1
+                val = dc[idx] if idx < len(dc) else ""
+            else:
+                val = row.get(col, "")
+
+            if isinstance(val, str):
+                cleaned = clean_excel_text(val)[:EXCEL_CELL_LIMIT]
+                if cleaned.startswith("="):
+                    cell = WriteOnlyCell(ws, value=cleaned)
+                    cell.data_type = "s"
+                    values.append(cell)
+                else:
+                    values.append(cleaned)
+            else:
+                values.append(val)
+        ws.append(values)
+
+    try:
+        wb.save(tmp_path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    finally:
+        wb.close()
+    return tmp_path
+
+
+def _write_rows(path: Path, rows: List[Dict[str, Any]]) -> None:
+    """Write rows in tracker format, atomically."""
+    tmp_path = _write_tmp_workbook(path, rows)
+    for attempt in range(5):
+        try:
+            os.replace(tmp_path, path)
+            return
+        except PermissionError:
+            if attempt == 4:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+            time.sleep(0.2)
+
+
 class PipelineTracker:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -353,6 +502,11 @@ class PipelineTracker:
         self._warned_rows = False
         self._warned_perm = False
         self.last_save_duration: float = 0.0
+        # Old finished rows are moved to <stem>_archive.xlsx (TRACKER_ARCHIVE_DAYS); the index
+        # keeps their blocked numbers and the next free lead number, so nothing is lost.
+        self.archive_path = self.path.with_name(f"{self.path.stem}_archive{self.path.suffix}")
+        self._archive_index_path = self.path.with_name(f".{self.path.stem}_archive_index.json")
+        self._archived_called: Set[str] = set()
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -369,6 +523,11 @@ class PipelineTracker:
         self._lock_fh = _acquire_os_lock(self._lock_path)
         try:
             self._load_existing()
+            self._load_archive_index()
+            try:
+                self._archive_old_rows()
+            except Exception as e:      # archiving is housekeeping: never block a run
+                logger.warning("Could not archive old tracker rows (%s); keeping them in %s.", e, self.path)
             self.mark_unfinished_interrupted()
         except Exception:
             _release_os_lock(self._lock_fh)
@@ -379,46 +538,11 @@ class PipelineTracker:
         if not self.path.exists():
             return
         try:
-            wb = load_workbook(self.path, read_only=True, data_only=True)
+            loaded = _read_rows(self.path)
         except Exception as e:
             self._quarantine_corrupt(e)
             return
-
-        try:
-            ws = wb[TRACKER_SHEET_NAME] if TRACKER_SHEET_NAME in wb.sheetnames else wb.active
-            rows_iter = ws.iter_rows(values_only=True)
-            header = [str(h).strip() if h is not None else "" for h in next(rows_iter, [])]
-            if not header or "lead_id" not in header:
-                raise ValueError("Missing 'lead_id' header in tracker workbook")
-
-            loaded: List[Dict[str, Any]] = []
-            max_num = 0
-            for vals in rows_iter:
-                if not vals or all(v in (None, "") for v in vals):
-                    continue
-                raw_row = {h: v for h, v in zip(header, vals) if h}
-                lead_chunks = []
-                dograh_chunks = []
-                row: Dict[str, Any] = {}
-                for k, v in raw_row.items():
-                    if k == "lead_json" or re.fullmatch(r"lead_json_\d+", k):
-                        lead_chunks.append((1 if k == "lead_json" else int(k.rsplit("_", 1)[1]), str(v or "")))
-                    elif k == "dograh_json" or re.fullmatch(r"dograh_json_\d+", k):
-                        dograh_chunks.append((1 if k == "dograh_json" else int(k.rsplit("_", 1)[1]), str(v or "")))
-                    else:
-                        row[k] = "" if v is None else v
-                row["lead_json"] = "".join(c for _, c in sorted(lead_chunks))
-                row["dograh_json"] = "".join(c for _, c in sorted(dograh_chunks))
-                lid = str(row.get("lead_id") or "").strip()
-                if not lid:
-                    continue
-                max_num = max(max_num, _parse_lead_num(lid))
-                loaded.append(row)
-        except Exception as e:
-            wb.close()
-            self._quarantine_corrupt(e)
-            return
-        wb.close()
+        max_num = max((_parse_lead_num(r.get("lead_id")) for r in loaded), default=0)
 
         with self._mem_lock:
             self._rows = loaded
@@ -438,6 +562,67 @@ class PipelineTracker:
                         tp,
                     )
             self._next_id = max_num + 1
+
+    # ------------------------------------------------------------------ archive
+
+    def _load_archive_index(self) -> None:
+        if not self._archive_index_path.is_file():
+            return
+        try:
+            data = json.loads(self._archive_index_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            logger.warning("Could not read %s (%s).", self._archive_index_path, e)
+            return
+        if not isinstance(data, dict):
+            return
+        with self._mem_lock:
+            self._archived_called = {str(n) for n in data.get("called_numbers") or [] if n}
+            self._next_id = max(self._next_id, _safe_int(data.get("next_lead_num"), default=1))
+
+    def _archive_old_rows(self) -> int:
+        """Move finished rows older than TRACKER_ARCHIVE_DAYS to the archive workbook. Returns how many."""
+        days = config.TRACKER_ARCHIVE_DAYS
+        if days <= 0:
+            return 0
+        cutoff = datetime.now() - timedelta(days=days)
+        with self._mem_lock:
+            old = []
+            for r in self._rows:
+                if str(r.get("stage") or "").strip() not in FINAL_STAGES:
+                    continue
+                when = _parse_dt(r.get("updated_at")) or _parse_dt(r.get("finished_at"))
+                if when is not None and when < cutoff:
+                    old.append(r)
+            if not old:
+                return 0
+            old_snapshot = [dict(r) for r in old]
+            called = set(self._archived_called) | {
+                str(r.get("phone_e164")).strip() for r in old_snapshot if _row_blocks_number(r)
+            }
+            next_num = self._next_id
+
+        # 1. archive workbook (rows already archived by an interrupted earlier attempt are not repeated)
+        existing = _read_rows(self.archive_path) if self.archive_path.exists() else []
+        known = {str(r.get("lead_id")) for r in existing}
+        _write_rows(self.archive_path, existing + [r for r in old_snapshot if str(r.get("lead_id")) not in known])
+        # 2. index: blocked numbers and the next lead number survive the move
+        tmp = self._archive_index_path.with_name(self._archive_index_path.name + ".tmp")
+        tmp.write_text(json.dumps({"called_numbers": sorted(called), "next_lead_num": next_num}), encoding="utf-8")
+        os.replace(tmp, self._archive_index_path)
+
+        # 3. drop them from the live tracker
+        moved_ids = {str(r.get("lead_id")) for r in old_snapshot}
+        with self._mem_lock:
+            self._archived_called = called
+            self._rows = [r for r in self._rows if str(r.get("lead_id")) not in moved_ids]
+            self._by_lead_id = {str(r["lead_id"]): r for r in self._rows}
+            self._by_source_key = {k: v for k, v in self._by_source_key.items()
+                                   if str(v.get("lead_id")) not in moved_ids}
+            self._mark_dirty()
+        self.save()
+        logger.info("Moved %d finished tracker row(s) older than %d days to %s.", len(moved_ids), days,
+                    self.archive_path)
+        return len(moved_ids)
 
     def _quarantine_corrupt(self, exc: Exception) -> None:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -460,18 +645,51 @@ class PipelineTracker:
             self._dirty_version += 1
 
     def called_numbers(self) -> Set[str]:
+        """Numbers never to call again (SKIP_ALREADY_CALLED), including archived rows."""
         with self._mem_lock:
-            called: Set[str] = set()
+            called: Set[str] = set(self._archived_called)
             for r in self._rows:
-                phone = str(r.get("phone_e164") or "").strip()
-                if not phone:
-                    continue
-                call_status = str(r.get("call_status") or "").strip()
-                run_id = r.get("dograh_run_id")
-                has_run = run_id is not None and str(run_id).strip() != ""
-                if call_status in ("called", "call_timeout") or has_run:
-                    called.add(phone)
+                if _row_blocks_number(r):
+                    called.add(str(r.get("phone_e164")).strip())
             return called
+
+    def unfinished_call_rows(self, max_age_days: int) -> List[Dict[str, Any]]:
+        """
+        Rows (copies) whose call result never arrived: put in a Dograh campaign
+        but stopped (interrupted) or timed out, without an outcome, updated
+        within max_age_days.
+        """
+        cutoff = datetime.now() - timedelta(days=max_age_days)
+        out: List[Dict[str, Any]] = []
+        with self._mem_lock:
+            for r in self._rows:
+                if not str(r.get("campaign_id") or "").strip() or str(r.get("call_disposition") or "").strip():
+                    continue
+                stage = str(r.get("stage") or "").strip()
+                if stage != "interrupted" and str(r.get("call_status") or "").strip() != "call_timeout":
+                    continue
+                updated = _parse_dt(r.get("updated_at"))
+                if updated is None or updated < cutoff:
+                    continue
+                out.append(dict(r))
+        return out
+
+    def record_run_seen(self, lead_id: str, run_id: Any, attempts: int) -> None:
+        """Remember that Dograh dialed this lead (its number is then never dialed again); the stage is unchanged."""
+        if run_id is None:
+            return
+        with self._mem_lock:
+            row = self._by_lead_id.get(lead_id)
+            if row is None:
+                return
+            row["dograh_run_id"] = run_id
+            row["call_attempts"] = attempts
+            if not row.get("call_started_at"):
+                row["call_started_at"] = row.get("updated_at") or _now_str()
+            row["updated_at"] = _now_str()
+            row["call_reason"] = "Call status unknown: the call was still going when the run stopped."
+            self._record_call_source_key(row)
+            self._mark_dirty()
 
     def mark_unfinished_interrupted(self, detail: str = "") -> None:
         now = _now_str()
@@ -511,8 +729,9 @@ class PipelineTracker:
         self._next_id += 1
         return lid
 
-    def register(self, lead: Dict[str, Any], source_label: str) -> str:
+    def register(self, lead: Dict[str, Any], source_label: str, batch_id: str = "") -> str:
         now = _now_str()
+        clean_batch_id = str(batch_id or "").strip()
         source_key, source_lead_id = _source_identity(lead)
         lead_json = json.dumps(lead, ensure_ascii=False, default=str)
         business = _business_name(lead)
@@ -528,12 +747,13 @@ class PipelineTracker:
 
             if earlier is not None:
                 earlier_id = str(earlier["lead_id"])
+                earlier_batch = str(earlier.get("batch_id") or "").strip()
                 has_call_activity = (
                     source_key in self._called_source_keys
                     or _has_call_activity(earlier)
                 )
                 times = max_times + 1
-                if earlier_id in self._registered_this_run or has_call_activity:
+                if earlier_id in self._registered_this_run or has_call_activity or (clean_batch_id and earlier_batch != clean_batch_id):
                     prev_id = earlier_id
                 else:
                     can_reuse = True
@@ -544,6 +764,7 @@ class PipelineTracker:
                     earlier[k] = ""
                 earlier["source_lead_id"] = source_lead_id
                 earlier["source_label"] = source_label
+                earlier["batch_id"] = clean_batch_id
                 earlier["previous_lead_id"] = str(earlier.get("previous_lead_id") or "")
                 earlier["times_processed"] = times
                 earlier["business"] = business
@@ -561,6 +782,7 @@ class PipelineTracker:
                     "source_key": source_key,
                     "source_lead_id": source_lead_id,
                     "source_label": source_label,
+                    "batch_id": clean_batch_id,
                     "previous_lead_id": prev_id,
                     "times_processed": times,
                     "business": business,
@@ -835,67 +1057,7 @@ class PipelineTracker:
             snapshot = [dict(r) for r in self._rows]
 
         started = time.monotonic()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.path.with_name(f".{self.path.stem}.{os.getpid()}.tmp{self.path.suffix}")
-
-        max_lead_chunks = 1
-        max_dograh_chunks = 1
-        split_rows: List[Tuple[Dict[str, Any], List[str], List[str]]] = []
-        for row in snapshot:
-            lc = _split_chunks(str(row.get("lead_json") or ""))
-            dc = _split_chunks(str(row.get("dograh_json") or ""))
-            max_lead_chunks = max(max_lead_chunks, len(lc))
-            max_dograh_chunks = max(max_dograh_chunks, len(dc))
-            split_rows.append((row, lc, dc))
-
-        columns = list(BASE_COLUMNS)
-        for i in range(2, max_lead_chunks + 1):
-            columns.append(f"lead_json_{i}")
-        for i in range(2, max_dograh_chunks + 1):
-            columns.append(f"dograh_json_{i}")
-
-        wb = Workbook(write_only=True)
-        ws = wb.create_sheet(title=TRACKER_SHEET_NAME)
-        ws.append(columns)
-
-        for row, lc, dc in split_rows:
-            values: List[Any] = []
-            for col in columns:
-                if col == "lead_json":
-                    val: Any = lc[0]
-                elif col.startswith("lead_json_"):
-                    idx = int(col.rsplit("_", 1)[1]) - 1
-                    val = lc[idx] if idx < len(lc) else ""
-                elif col == "dograh_json":
-                    val = dc[0]
-                elif col.startswith("dograh_json_"):
-                    idx = int(col.rsplit("_", 1)[1]) - 1
-                    val = dc[idx] if idx < len(dc) else ""
-                else:
-                    val = row.get(col, "")
-
-                if isinstance(val, str):
-                    cleaned = clean_excel_text(val)[:EXCEL_CELL_LIMIT]
-                    if cleaned.startswith("="):
-                        cell = WriteOnlyCell(ws, value=cleaned)
-                        cell.data_type = "s"
-                        values.append(cell)
-                    else:
-                        values.append(cleaned)
-                else:
-                    values.append(val)
-            ws.append(values)
-
-        try:
-            wb.save(tmp_path)
-        except Exception:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
-        finally:
-            wb.close()
+        tmp_path = _write_tmp_workbook(self.path, snapshot)
 
         last_err: Optional[PermissionError] = None
         for attempt in range(5):

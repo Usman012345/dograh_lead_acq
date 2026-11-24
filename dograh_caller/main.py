@@ -163,12 +163,19 @@ def run(
     score_only: bool = False,
     source_label: Optional[str] = None,
     on_failed: Optional[Callable[[List[Dict[str, Any]]], Any]] = None,
+    retry_failed_calls: Optional[bool] = None,
+    on_call_retry: Optional[Callable[[List[Dict[str, Any]]], Any]] = None,
 ) -> int:
     """
     Run leads through the pipeline.
     When score_only=True, leads are verified and scored without placing any calls.
     `source` can be a file path, one lead dict, or a list of lead dicts.
-    Returns 0 on success, 1 on error.
+    retry_failed_calls: also keep leads whose call reached nobody, to call them
+    again (default RETRY_FAILED_CALLS); never-dialed leads are always kept.
+    Leads to retry go to on_failed / on_call_retry, or else to
+    output/decision_retry_<time>.json / output/call_retry_<time>.json - also
+    when the run ends with an error or Ctrl+C.
+    Returns 0 on success, 1 on error, 130 if interrupted.
     """
     active_threshold = config.INTEREST_THRESHOLD if threshold is None else threshold
     if not 0 < active_threshold <= 1:
@@ -201,6 +208,11 @@ def run(
     else:
         print(f"Loaded {len(leads)} lead(s) - LIVE: qualified leads will be called")
     failed: List[Dict[str, Any]] = []
+    call_retry: List[Dict[str, Any]] = []
+    pipeline_kwargs: Dict[str, Any] = {}
+    if retry_failed_calls is not None:
+        pipeline_kwargs["retry_failed_calls"] = retry_failed_calls
+    code = 0
     try:
         run_leads_sync(
             leads,
@@ -208,25 +220,38 @@ def run(
             results_file=output,
             score_only=score_only,
             failed_leads=failed,
+            retry_leads=call_retry,
             source_label=source_label,
+            **pipeline_kwargs,
         )
     except KeyboardInterrupt:
         print("\nStopped by user. This run's campaigns were paused; leads still in progress were not saved.")
-        return 130
+        code = 130
     except Exception as e:
         print(f"\nERROR: {e}")
-        return 1
-    if failed and on_failed is not None:
-        on_failed(failed)
-    elif failed:
-        retry_dir = config.PROJECT_DIR / "output"
-        retry_dir.mkdir(parents=True, exist_ok=True)
-        retry_path = retry_dir / f"decision_retry_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        retry_path.write_text(json.dumps(failed, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
-        flag = " --score-only" if score_only else ""
-        print(f"{len(failed)} lead(s) failed Gemini scoring and were saved to {retry_path}")
-        print(f"Re-run them with: python main.py {retry_path}{flag}")
-    return 0
+        code = 1
+    # Saved whatever way the run ended, so these leads are never lost
+    flag = " --score-only" if score_only else ""
+    _save_retry(failed, on_failed, "decision_retry",
+                "lead(s) failed Gemini scoring and were saved to", flag)
+    _save_retry(call_retry, on_call_retry, "call_retry",
+                "lead(s) whose call should be tried again were saved to", flag)
+    return code
+
+
+def _save_retry(leads: List[Dict[str, Any]], handler: Optional[Callable[[List[Dict[str, Any]]], Any]],
+                prefix: str, what: str, flag: str) -> None:
+    if not leads:
+        return
+    if handler is not None:
+        handler(leads)
+        return
+    retry_dir = config.PROJECT_DIR / "output"
+    retry_dir.mkdir(parents=True, exist_ok=True)
+    retry_path = retry_dir / f"{prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    retry_path.write_text(json.dumps(leads, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    print(f"{len(leads)} {what} {retry_path}")
+    print(f"Re-run them with: python main.py {retry_path}{flag}")
 
 
 def run_configured(
@@ -235,6 +260,7 @@ def run_configured(
     limit: Optional[int] = None,
     threshold: Optional[float] = None,
     output: Optional[str] = None,
+    retry_failed_calls: Optional[bool] = None,
 ) -> int:
     """`python main.py`: run INPUT_FILE_PATH / INPUT_LEADS configured in main.py (polls streamer only if USE_STREAMER = True)."""
     active_threshold = config.INTEREST_THRESHOLD if threshold is None else threshold
@@ -275,7 +301,10 @@ def run_configured(
     if leads:
         label = f"file:{Path(INPUT_FILE_PATH).name}" if INPUT_FILE_PATH and not INPUT_LEADS else "python"
         code = run(leads, limit=limit, threshold=threshold, output=output, source_label=label,
-                   on_failed=pull_leads.save_failed_for_retry if USE_STREAMER else None)
+                   retry_failed_calls=retry_failed_calls,
+                   on_failed=pull_leads.save_failed_for_retry if USE_STREAMER else None,
+                   on_call_retry=(lambda ls: pull_leads.save_failed_for_retry(ls, source="call_retry"))
+                   if USE_STREAMER else None)
         if code != 0:
             return code
     if not USE_STREAMER:
@@ -286,7 +315,9 @@ def run_configured(
         token=config.LEAD_SOURCE_TOKEN,
         timeout=config.LEAD_SOURCE_TIMEOUT,
         store=pull_leads.BatchStore(config.PULLED_BATCHES_DIR),
-        process=lambda batch: pull_leads.default_process(batch, threshold, output),
+        process=lambda batch, **kw: pull_leads.call_with_supported_kwargs(
+            pull_leads.default_process, batch, threshold, output,
+            retry_failed_calls=retry_failed_calls, **kw),
     )
     return puller.run_auto(STREAMER_CHECK_SECONDS)
 
@@ -302,13 +333,17 @@ def main() -> int:
     parser.add_argument("--limit", type=int, help="Only process the first N leads")
     parser.add_argument("--score-only", action="store_true",
                         help="Verify and score leads without creating Dograh campaigns or placing calls")
+    parser.add_argument("--retry-failed-calls", action=argparse.BooleanOptionalAction, default=None,
+                        help="Save leads whose call reached nobody (busy, no answer, failed, voicemail) to call "
+                             f"them again (default RETRY_FAILED_CALLS={config.RETRY_FAILED_CALLS})")
     args = parser.parse_args()
 
     sheet = args.sheet or INPUT_SHEET
 
     if not args.input and not args.score_only:
         return run_configured(sheet=sheet, limit=args.limit if args.limit is not None else LIMIT,
-                              threshold=args.threshold, output=args.output)
+                              threshold=args.threshold, output=args.output,
+                              retry_failed_calls=args.retry_failed_calls)
 
     try:
         if args.input:
@@ -332,9 +367,13 @@ def main() -> int:
         return 1
 
     limit = args.limit if args.limit is not None else LIMIT
+    import pull_leads
+    # kill / systemctl stop / a dropped SSH session act like Ctrl+C: campaigns are paused, results saved
+    pull_leads.stop_signals_act_like_ctrl_c()
     return run(leads, limit=limit,
                threshold=args.threshold, output=args.output,
-               score_only=args.score_only, source_label=source_label)
+               score_only=args.score_only, source_label=source_label,
+               retry_failed_calls=args.retry_failed_calls)
 
 
 if __name__ == "__main__":
